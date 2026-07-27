@@ -1,0 +1,31 @@
+﻿# Данные - слишком большие для git, генерируются пайплайном
+twcs.csv
+twcs/
+twitter_support_filtered.csv
+twitter_support_final*.csv
+twitter_support_labeled*.csv
+twitter_support_with_priority*.csv
+kb_with_index.csv
+llm_vs_rule_comparison*.csv
+buf_with_lang*.csv
+
+# Эмбеддинги и модели - большие бинарные файлы
+*.npy
+*.joblib
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Ключи и секреты
+*.env
+Data
+Data.txt
+voyage_key.txt
+
+# IDE
+.idea/
+.vscode/
+archive/
