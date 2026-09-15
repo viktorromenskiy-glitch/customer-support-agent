@@ -129,6 +129,6 @@ Model artifacts (`.joblib`, `.npy`, `kb_with_index.csv`) are not committed to gi
 
 Python - scikit-learn - Voyage AI (embeddings) - Anthropic Claude (labeling + response drafting) - FastAPI - Docker
 
-## Author
+## About the author
 
-Viktor Romensky
+Viktor Romenskiy — GenAI/ML engineer (RAG systems, LLM evaluation, fine-tuning). GitHub: [viktorromenskiy-glitch](https://github.com/viktorromenskiy-glitch) · LinkedIn: [profile](https://www.linkedin.com/in/%D0%B2%D0%B8%D0%BA%D1%82%D0%BE%D1%80-%D1%80%D0%BE%D0%BC%D0%B5%D0%BD%D1%81%D0%BA%D0%B8%D0%B9-029b2086/) · Hugging Face: [ViktorPetrov123](https://huggingface.co/ViktorPetrov123) · Contact: viktorromenskiy@gmail.com
