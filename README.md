@@ -58,6 +58,7 @@ All numbers in the table above were recomputed from the saved embeddings and lab
 - **Search:** on all 4,000 test tickets the category matches in the top 5 in 58.6% of cases (95% CI 57.5-59.7%), using the saved embeddings (document type). The 58.1% above comes from a sample of 500 tickets embedded as queries, and those query embeddings were not saved. For comparison, random search gives 14.7% (using the real class shares; 12.5% would be right only if all 8 classes were equally common), and always returning neighbours from the most common category gives 19.8%.
 - **Duplicates:** 55 of the 4,000 test tickets (1.4%) have an exact copy in the training data once @mentions and links are removed and case and spacing are ignored. Without them, category accuracy drops by about 0.3 percentage points. Reworded duplicates were not searched for.
 - **Category accuracy:** 95% CI 69.1-71.9%. Embeddings beat TF-IDF by 10.1-13.1 points (paired test, p < 1e-50).
+- **Feature removed:** the models used to take a `is_dm_escalation` flag that was computed from the company's reply, which the agent does not have when a new ticket arrives. It was removed. Without it the held-out results are the same: category 70.60% (F1 0.686), priority 60.42% (F1 0.594).
 
 ## Why embeddings instead of TF-IDF
 
@@ -125,7 +126,7 @@ export ANTHROPIC_API_KEY="..."
 uvicorn app:app --reload
 ```
 
-Then: `POST http://localhost:8000/handle_ticket` with `{"text": "...", "company": "AmazonHelp", "is_dm_escalation": false}`.
+Then: `POST http://localhost:8000/handle_ticket` with `{"text": "...", "company": "AmazonHelp"}`.
 
 ### 5. Or run in Docker
 
