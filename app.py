@@ -21,7 +21,6 @@ app = FastAPI(
 class TicketRequest(BaseModel):
     text: str
     company: str = "AmazonHelp"
-    is_dm_escalation: bool = False
 
 
 class TicketResponse(BaseModel):
@@ -47,7 +46,6 @@ def process_ticket(request: TicketRequest):
     result = handle_ticket(
         text=request.text,
         company=request.company,
-        is_dm_escalation=request.is_dm_escalation,
         verbose=False,
     )
     return TicketResponse(**result)
