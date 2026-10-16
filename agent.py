@@ -137,7 +137,7 @@ def draft_response(text, retrieved):
     )
     user_msg = f"Similar past examples:\n\n{examples}\n\nNew customer message:\n{text}\n\nDraft response:"
     resp = claude_client.messages.create(
-        model=CLAUDE_MODEL, max_tokens=200, temperature=0.3,
+        model=CLAUDE_MODEL, max_tokens=200,
         system=system_prompt,
         messages=[{"role": "user", "content": user_msg}],
     )
