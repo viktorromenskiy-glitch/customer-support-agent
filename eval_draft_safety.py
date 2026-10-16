@@ -77,4 +77,13 @@ print(out.groupby("mode")["has_defect"].agg(["sum", "count", "mean"]).round(3))
 print("\nBy defect type:")
 for code in ("foreign_url", "foreign_signature", "mention", "placeholder"):
     print(code, out.groupby("mode")["defects_in_raw"].apply(lambda s: s.str.contains(code).sum()).to_dict())
-print(f"\nSaved {OUT}")
+
+# Section 1 of the working rules: hard completeness check and the absolute path, printed last.
+expected = n * len(MODES)
+print("\n" + "=" * 70)
+print("RESULT FILE (absolute path):")
+print(os.path.abspath(OUT))
+print("=" * 70)
+if len(out) != expected:
+    raise SystemExit(f"INCOMPLETE: {len(out)} of {expected} drafts saved. Run the same command again to finish.")
+print(f"COMPLETE: all {expected} drafts saved.")
