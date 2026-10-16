@@ -90,24 +90,23 @@ def get_embedding(text):
     raise RuntimeError("Could not get an embedding after all attempts")
 
 
-def build_features(embedding, bundle, company, is_dm_escalation):
-    """Same feature assembly used at training time: embedding + company (OHE) + is_dm_escalation."""
+def build_features(embedding, bundle, company):
+    """Same feature assembly used at training time: embedding + company (OHE)."""
     company_encoded = bundle["ohe"].transform(pd.DataFrame([{"company": company}]))
     return hstack([
         csr_matrix(embedding),
         company_encoded,
-        csr_matrix(np.array([[is_dm_escalation]])),
     ])
 
 
-def classify_from_embedding(embedding, company, is_dm_escalation):
+def classify_from_embedding(embedding, company):
     """Classifies category and priority from an already-computed embedding."""
-    cat_features = build_features(embedding, category_bundle, company, is_dm_escalation)
+    cat_features = build_features(embedding, category_bundle, company)
     category = category_bundle["classifier"].predict(cat_features)[0]
     category = CATEGORY_RU_TO_EN.get(category, category)
     category_proba = category_bundle["classifier"].predict_proba(cat_features).max()
 
-    pri_features = build_features(embedding, priority_bundle, company, is_dm_escalation)
+    pri_features = build_features(embedding, priority_bundle, company)
     priority = priority_bundle["classifier"].predict(pri_features)[0]
     priority = PRIORITY_RU_TO_EN.get(priority, priority)
     priority_proba = priority_bundle["classifier"].predict_proba(pri_features).max()
@@ -145,11 +144,11 @@ def draft_response(text, retrieved):
     return resp.content[0].text.strip()
 
 
-def handle_ticket(text, company="AmazonHelp", is_dm_escalation=False, verbose=True):
+def handle_ticket(text, company="AmazonHelp", verbose=True):
     """Full cycle: one embedding -> classify -> retrieve -> decide -> respond or escalate."""
     embedding = get_embedding(text)  # the only Voyage call in the whole cycle
 
-    category, cat_conf, priority, pri_conf = classify_from_embedding(embedding, company, is_dm_escalation)
+    category, cat_conf, priority, pri_conf = classify_from_embedding(embedding, company)
     retrieved = retrieve_similar_from_embedding(embedding, k=5)
     top_similarity = retrieved.iloc[0]["similarity"]
 
@@ -183,5 +182,5 @@ if __name__ == "__main__":
     test_examples = df.iloc[int(len(df)*0.8):].sample(5, random_state=7)
 
     for _, row in test_examples.iterrows():
-        handle_ticket(row["request_text"], company=row["company"], is_dm_escalation=row["is_dm_escalation"])
+        handle_ticket(row["request_text"], company=row["company"])
         time.sleep(20)  # pause to respect the 3 requests/minute free-tier limit
