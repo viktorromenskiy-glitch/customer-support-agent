@@ -108,7 +108,7 @@ for i, (_, row) in enumerate(test_sample.iterrows()):
     category_matches.append(match_rate)
 
 print(f"\n=== SEMANTIC search: category-match rate in top-{K} = {np.mean(category_matches)*100:.1f}% ===")
-print(f"(TF-IDF was: 36.3%, random baseline: 12.5%)")
+print(f"(TF-IDF was: 36.3%, random: 14.7% with real class shares (12.5% only if all 8 classes were equally common); always the most common category: 19.8%)")
 
 # The same real "problem" example - Amazon lockers
 lockers_idx = test_sample[test_sample["request_text"].str.contains("lockers", case=False, na=False)].index
