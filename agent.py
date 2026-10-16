@@ -177,7 +177,7 @@ def handle_ticket(text, company="AmazonHelp", is_dm_escalation=False, verbose=Tr
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("archive/twitter_support_labeled_FINAL.csv")
+    df = pd.read_csv("archive/twitter_support_labeled_final.csv")
     df["request_created_at"] = pd.to_datetime(df["request_created_at"], errors="coerce", utc=True)
     df = df.sort_values("request_created_at").reset_index(drop=True)
     test_examples = df.iloc[int(len(df)*0.8):].sample(5, random_state=7)
