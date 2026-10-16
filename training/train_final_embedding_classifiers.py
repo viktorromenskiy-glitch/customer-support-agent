@@ -31,16 +31,19 @@ ohe = OneHotEncoder(handle_unknown="ignore")
 company_encoded = ohe.fit_transform(df[["company"]])
 
 
-def build_features(embeddings, company_encoded_part, is_dm_escalation):
-    """Единая функция сборки признаков - используется и здесь, и в агенте."""
+def build_features(embeddings, company_encoded_part):
+    """Единая функция сборки признаков - используется и здесь, и в агенте.
+
+    Признак is_dm_escalation убран: он строился по тексту ОТВЕТА компании, которого
+    у агента на входе нет (проверка 16.10.2026: без него метрики те же).
+    """
     return hstack([
         csr_matrix(embeddings),
         company_encoded_part,
-        csr_matrix(np.array(is_dm_escalation).reshape(-1, 1)),
     ])
 
 
-X_full = build_features(all_vectors, company_encoded, df["is_dm_escalation"].values)
+X_full = build_features(all_vectors, company_encoded)
 
 # Честная оценка на отложенной по времени части (как и раньше) - для отчётности
 split_idx = int(len(df) * 0.8)
