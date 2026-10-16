@@ -29,7 +29,7 @@ import voyageai
 from anthropic import Anthropic
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.sparse import hstack, csr_matrix
-from draft_safety import DraftPolicy, scrub_precedent, sanitize_draft, find_defects
+from draft_safety import DraftPolicy, scrub_precedent, sanitize_draft_ex, find_defects, needs_review
 
 VOYAGE_MODEL = "voyage-4-lite"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
@@ -161,9 +161,13 @@ def draft_response(text, retrieved, mode=None, policy=None, return_details=False
     )
     raw_draft = resp.content[0].text.strip()
     defects = find_defects(raw_draft, policy)
-    draft = sanitize_draft(raw_draft, policy)[0] if mode == "clean_filter" else raw_draft
+    dropped = []
+    draft = raw_draft
+    if mode == "clean_filter":
+        draft, _, dropped = sanitize_draft_ex(raw_draft, policy)
     if return_details:
-        return {"draft": draft, "raw_draft": raw_draft, "defects_in_raw": defects}
+        return {"draft": draft, "raw_draft": raw_draft, "defects_in_raw": defects,
+                "dropped_sentences": dropped, "needs_review": needs_review(draft, dropped) if mode == "clean_filter" else False}
     return draft
 
 
@@ -190,12 +194,15 @@ def handle_ticket(text, company="AmazonHelp", verbose=True):
             print(f"-> DECISION: escalate to a human (priority \"{priority}\" requires a closer match)")
         return {"action": "escalate", "category": category, "priority": priority, "top_similarity": top_similarity}
     else:
-        draft = draft_response(text, retrieved)
+        det = draft_response(text, retrieved, return_details=True)
+        draft = det["draft"]
         if verbose:
             print(f"-> DECISION: draft response generated")
             print(f"Draft: {draft}")
+            if det["needs_review"]:
+                print("   NOTE: the safety filter removed part of this draft - check it before sending.")
         return {"action": "draft", "category": category, "priority": priority,
-                "top_similarity": top_similarity, "draft": draft}
+                "top_similarity": top_similarity, "draft": draft, "needs_review": det["needs_review"]}
 
 
 if __name__ == "__main__":
