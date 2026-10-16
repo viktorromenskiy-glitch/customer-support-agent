@@ -9,3 +9,7 @@ joblib>=1.5.0
 voyageai>=0.3.0
 anthropic>=0.40.0
 langdetect>=1.0.9  # data_pipeline/sample_and_filter.py - missing from this file, added during portfolio hygiene pass
+
+# The README numbers were re-checked on 16 Oct 2026 with scikit-learn 1.9.1, numpy 2.2.6, pandas 2.2.3, scipy 1.14.1.
+# The saved models in archive/ were trained with scikit-learn 1.9.0.
+# Search results depend on array precision: float32 gives 58.76% instead of 58.60% on the 4,000-ticket test set.
