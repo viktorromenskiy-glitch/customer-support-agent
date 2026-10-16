@@ -29,6 +29,7 @@ import voyageai
 from anthropic import Anthropic
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.sparse import hstack, csr_matrix
+from draft_safety import DraftPolicy, scrub_precedent, sanitize_draft, find_defects
 
 VOYAGE_MODEL = "voyage-4-lite"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
@@ -123,10 +124,22 @@ def retrieve_similar_from_embedding(embedding, k=5):
     return retrieved
 
 
-def draft_response(text, retrieved):
+# Draft safety modes (see draft_safety.py):
+#   "raw"          - past replies go into the prompt as they are (the old behavior)
+#   "clean"        - past replies are cleaned first (links -> [LINK], sign-offs and @mentions removed)
+#   "clean_filter" - "clean" + the finished draft is checked; foreign links/sign-offs are removed
+DRAFT_MODE = "clean_filter"
+# The client's own approved links and sign-off. Empty = no link, no signature is added.
+DRAFT_POLICY = DraftPolicy(approved_urls=[], signature="")
+
+
+def draft_response(text, retrieved, mode=None, policy=None, return_details=False):
     """Generates a draft response grounded in the retrieved precedents."""
+    mode = mode or DRAFT_MODE
+    policy = policy or DRAFT_POLICY
+    prep = (lambda x: x) if mode == "raw" else scrub_precedent
     examples = "\n\n".join(
-        f"Similar past request: {r['request_text']}\nHow it was answered then: {r['response_text']}"
+        f"Similar past request: {prep(r['request_text'])}\nHow it was answered then: {prep(r['response_text'])}"
         for _, r in retrieved.head(3).iterrows()
     )
     system_prompt = (
@@ -135,13 +148,23 @@ def draft_response(text, retrieved):
         "Do not invent facts that aren't present in the examples - if unsure, suggest asking "
         "the customer for more details instead."
     )
+    if mode != "raw":
+        system_prompt += (
+            " In the examples, [LINK] marks a web link that was removed. Never write a web link, "
+            "a staff name or initials, a sign-off, or an @mention in your reply, and do not write [LINK]."
+        )
     user_msg = f"Similar past examples:\n\n{examples}\n\nNew customer message:\n{text}\n\nDraft response:"
     resp = claude_client.messages.create(
         model=CLAUDE_MODEL, max_tokens=200,
         system=system_prompt,
         messages=[{"role": "user", "content": user_msg}],
     )
-    return resp.content[0].text.strip()
+    raw_draft = resp.content[0].text.strip()
+    defects = find_defects(raw_draft, policy)
+    draft = sanitize_draft(raw_draft, policy)[0] if mode == "clean_filter" else raw_draft
+    if return_details:
+        return {"draft": draft, "raw_draft": raw_draft, "defects_in_raw": defects}
+    return draft
 
 
 def handle_ticket(text, company="AmazonHelp", verbose=True):
