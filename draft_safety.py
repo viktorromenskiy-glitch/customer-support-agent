@@ -28,7 +28,9 @@ URL_RE = re.compile(r"(?:https?://|www\.)" + _TAIL + r"|\b\w[\w-]*\.(?:com|co|ly
 SIGNOFF_RE = re.compile(r"(?<!\w)[\^*/~]\s?[A-Z]{1,4}\s*$")
 # sign-off followed by a link that was replaced by the placeholder: "... /DQ [LINK]"
 SIGNOFF_BEFORE_LINK_RE = re.compile(r"(?<!\w)[\^*/~]\s?[A-Z]{1,4}\s+\[LINK\]\s*$")
-MENTION_RE = re.compile(r"(?<!\w)@\w+")
+MENTION_RE = re.compile(r"(?<!\w)@\[?\w+\]?")   # also "@[CustomerHandle]"
+# Unfilled template slots such as "[Customer]" or "[Order Number]" ([LINK] is our own marker, handled apart).
+TEMPLATE_RE = re.compile(r"\[(?!LINK\])[A-Za-z][A-Za-z _-]{1,30}\]")
 # A trailing punctuation mark glued to a removed link ("here: .") is tidied after.
 TIDY_SPACES = re.compile(r"[ \t]{2,}")
 TIDY_BEFORE_PUNCT = re.compile(r"\s+([.,!?;:])")
@@ -69,6 +71,8 @@ def find_defects(draft, policy=None):
             out.append(("foreign_url", m.group(0)))
     if PLACEHOLDER in draft:
         out.append(("placeholder", PLACEHOLDER))
+    for m in TEMPLATE_RE.finditer(MENTION_RE.sub("", draft)):
+        out.append(("template_slot", m.group(0)))
     sig = SIGNOFF_RE.search(draft.rstrip())
     if sig and sig.group(0).strip() != policy.signature.strip():
         out.append(("foreign_signature", sig.group(0).strip()))
@@ -77,31 +81,52 @@ def find_defects(draft, policy=None):
     return out
 
 
-def sanitize_draft(draft, policy=None):
+SENTENCE_RE = re.compile(r".+?(?:[.!?](?=\s|$)|$)\s*", re.S)   # a sentence plus its trailing whitespace
+
+
+def sanitize_draft_ex(draft, policy=None):
     """Layer 3: remove disallowed elements; add the client's own signature if set.
     A sentence that carries a foreign link or a leftover [LINK] is dropped as a whole
     (cutting only the link leaves broken sentences such as "reach out to us here:").
     [LINK] becomes the client's first approved link when there is one.
-    Returns (clean_draft, defects_found)."""
+    Original line breaks and lists are kept.
+    Returns (clean_draft, defects_found, dropped_sentences)."""
     policy = policy or DraftPolicy()
     defects = find_defects(draft, policy)
     allowed = {_norm_url(u) for u in policy.approved_urls}
-    t = MENTION_RE.sub("", draft).rstrip()
+    t = MENTION_RE.sub("", draft)
+    t = TEMPLATE_RE.sub("", t)
+    t = t.rstrip()
     sig = SIGNOFF_RE.search(t)
     if sig and sig.group(0).strip() != policy.signature.strip():
         t = t[:sig.start()].rstrip()
     if policy.approved_urls:
         t = t.replace(PLACEHOLDER, policy.approved_urls[0])
-    kept = []
-    for sent in SENT_SPLIT.split(t):
-        bad_url = any(_norm_url(m.group(0)) not in allowed for m in URL_RE.finditer(sent))
+    kept, dropped = [], []
+    for m in SENTENCE_RE.finditer(t):
+        sent = m.group(0)
+        bad_url = any(_norm_url(u.group(0)) not in allowed for u in URL_RE.finditer(sent))
         if bad_url or PLACEHOLDER in sent:
-            continue
-        kept.append(sent)
-    t = TIDY_SPACES.sub(" ", " ".join(kept)).strip()
+            dropped.append(sent.strip())
+        else:
+            kept.append(sent)
+    t = TIDY_SPACES.sub(" ", "".join(kept)).strip()
+    t = TIDY_BEFORE_PUNCT.sub(r"\1", t)
     if policy.signature and t and not t.endswith(policy.signature):
         t = f"{t}\n{policy.signature}"
+    return t, defects, dropped
+
+
+def sanitize_draft(draft, policy=None):
+    """Same as sanitize_draft_ex, returns (clean_draft, defects_found)."""
+    t, defects, _ = sanitize_draft_ex(draft, policy)
     return t, defects
+
+
+def needs_review(draft, dropped, min_chars=80):
+    """True when the filter removed a sentence or what is left is very short:
+    the draft may have lost its call to action and a person should look at it."""
+    return bool(dropped) or len(draft.strip()) < min_chars
 
 
 # --- self-tests -----------------------------------------------------------
@@ -161,6 +186,19 @@ def _selftest():
     check("glued sign-off", scrub_precedent("Happy to help.^SQ") == "Happy to help.")
     check("sign-off before link", "/DQ" not in scrub_precedent("We'll check it out /DQ https://t.co/ab"))
     check("A/B kept", scrub_precedent("Try A/B") == "Try A/B")
+    # bracketed template slots and mentions
+    check("template mention flagged", any(c == "mention" for c, _ in find_defects("@[CustomerHandle] Thanks for writing.")))
+    check("template mention removed", sanitize_draft("@[Customer] Thanks for writing.")[0] == "Thanks for writing.")
+    check("template slot flagged", any(c == "template_slot" for c, _ in find_defects("Hi [Customer Name], thanks.")))
+    check("[LINK] not a template slot", not any(c == "template_slot" for c, _ in find_defects("See [LINK].")))
+    # list formatting survives
+    lst = "Please send:\n\n- Your order number?\n- The date?\n\nThanks!"
+    check("list kept", sanitize_draft(lst)[0] == lst)
+    # review flag
+    t2, _, dr = sanitize_draft_ex("We understand your frustration! Please reach out at https://t.co/x with details.")
+    check("dropped reported", len(dr) == 1 and needs_review(t2, dr))
+    t3, _, dr3 = sanitize_draft_ex("We are sorry for the delay on your order. Could you share the order number so we can check?")
+    check("no review when nothing removed", not needs_review(t3, dr3))
     check("empty draft", sanitize_draft("")[0] == "")
     check("no defects on plain text", find_defects("We are sorry for the delay. Please share your order number.") == [])
     print(f"self-tests: {ok} passed, {fail} failed")
