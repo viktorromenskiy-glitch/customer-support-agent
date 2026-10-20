@@ -4,6 +4,11 @@ Ticket triage: CSV in -> same CSV out, with category, priority and a "pass to a 
 Usage (PowerShell, from the project folder that holds the two .joblib model files):
     python triage.py tickets.csv --dry-run      # checks the file, no API calls, no cost
     python triage.py tickets.csv                # writes tickets_triaged.csv next to the input
+    python triage.py tickets.csv --min-category-confidence 0.8     # stricter: more tickets go to a human
+    python triage.py tickets.csv --min-priority-confidence 0.6     # also use the priority confidence
+
+A ticket goes to a human when the category confidence is below 0.70 (default). The priority is a
+hint unless --min-priority-confidence is given. See the comment at MIN_CATEGORY_CONFIDENCE.
 
 Input CSV: a required `text` column; optional `id` and `company`; any other columns are kept.
 Output CSV: all input columns plus
@@ -41,10 +46,15 @@ MODELS_DIR_DEFAULT = "."
 CATEGORY_MODEL_FILE = "category_classifier_embeddings.joblib"
 PRIORITY_MODEL_FILE = "priority_classifier_embeddings.joblib"
 
-# PROVISIONAL thresholds: a ticket goes to a human when the classifier is less sure than this.
-# They are placeholders until they are chosen on held-out data (plan step B3).
-MIN_CATEGORY_CONFIDENCE = 0.50
-MIN_PRIORITY_CONFIDENCE = 0.50
+# Pass-to-human policy (chosen in plan step B3, see claude/triage-threshold-addendum-2026-10-20.md):
+# a ticket goes to a human when the category confidence (maximum class probability) is below
+# MIN_CATEGORY_CONFIDENCE. The priority confidence is only a hint unless --min-priority-confidence is given.
+# On held-out tickets (classifier trained on the first 12,000 of 20,000 tickets, labels set by a language
+# model, not by humans) the share of wrong categories among tickets handled automatically was about
+# 10% at 0.70 and about 6.5% at 0.80, with a cluster-bootstrap 95% interval of roughly 8-13% and 4.5-9%.
+# This must be re-checked on the client's own tickets labelled by people (plan step B4).
+MIN_CATEGORY_CONFIDENCE = 0.70
+MIN_PRIORITY_CONFIDENCE = None    # None = priority confidence does not send a ticket to a human
 
 DEFAULT_COMPANY = "unknown"   # the encoder ignores unseen companies (all-zero company features)
 
@@ -62,6 +72,11 @@ PRIORITY_RU_TO_EN = {"Критический": "Critical", "Высокий": "Hi
 
 OUT_COLUMNS = ["category", "category_confidence", "priority", "priority_confidence",
                "needs_human", "needs_human_reason", "model_version"]
+# Columns of the progress file: raw model results only. The pass-to-human decision is made once,
+# at the end, from the full-precision confidences, so every row follows the same thresholds
+# even when a run is stopped and restarted with other thresholds.
+PARTIAL_COLUMNS = ["row", "category", "category_confidence", "priority", "priority_confidence",
+                   "empty_text", "model_version"]
 
 
 def clean(text):
@@ -109,14 +124,23 @@ def predict(embeddings, companies, bundle, ru_to_en):
     return labels, proba.max(axis=1)
 
 
-def decide_human(category_conf, priority_conf, empty):
-    """Returns (needs_human, reason). Reasons are joined with ';' when several apply."""
+def decide_human(category_conf, priority_conf, empty, min_category=MIN_CATEGORY_CONFIDENCE,
+                 min_priority=MIN_PRIORITY_CONFIDENCE):
+    """Returns (needs_human, reason). Reasons are joined with ';' when several apply.
+
+    Args:
+        category_conf: maximum class probability of the category classifier.
+        priority_conf: maximum class probability of the priority classifier.
+        empty: True when the ticket text is empty after cleaning (always goes to a human).
+        min_category: below this category confidence the ticket goes to a human.
+        min_priority: below this priority confidence the ticket goes to a human; None = not used.
+    """
     if empty:
         return "yes", "empty_text"
     reasons = []
-    if category_conf < MIN_CATEGORY_CONFIDENCE:
+    if category_conf < min_category:
         reasons.append("low_category_confidence")
-    if priority_conf < MIN_PRIORITY_CONFIDENCE:
+    if min_priority is not None and priority_conf < min_priority:
         reasons.append("low_priority_confidence")
     return ("yes" if reasons else "no"), ";".join(reasons)
 
@@ -148,8 +172,24 @@ def read_input(path):
     return df
 
 
-def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=64, dry_run=False, client=None):
-    """Runs the whole triage. Returns the absolute path of the output file (None for a dry run)."""
+def check_threshold(name, value):
+    """Stops with a clear message when a threshold is not a number between 0 and 1 (None is allowed for priority)."""
+    if value is None:
+        return
+    if not (0.0 <= float(value) <= 1.0):
+        raise SystemExit(f"{name} must be between 0 and 1, got {value}")
+
+
+def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=64, dry_run=False, client=None,
+        min_category=MIN_CATEGORY_CONFIDENCE, min_priority=MIN_PRIORITY_CONFIDENCE):
+    """Runs the whole triage. Returns the absolute path of the output file (None for a dry run).
+
+    Args:
+        min_category: tickets with category confidence below this go to a human.
+        min_priority: tickets with priority confidence below this go to a human; None = priority is only a hint.
+    """
+    check_threshold("--min-category-confidence", min_category)
+    check_threshold("--min-priority-confidence", min_priority)
     df = read_input(input_path)
     n = len(df)
     cleaned = df["text"].map(clean)
@@ -161,6 +201,8 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
 
     print(f"Input: {os.path.abspath(input_path)}")
     print(f"Rows: {n}  (empty after cleaning: {int(empty.sum())})")
+    print(f"Policy: to a human if category confidence < {min_category}"
+          + (f" or priority confidence < {min_priority}" if min_priority is not None else " (priority is a hint only)"))
     to_embed_total = int((~empty).sum())
     est_tokens = int(cleaned[~empty].str.len().sum() / 4) + to_embed_total
     print(f"Rows to embed: {to_embed_total}; rough size estimate: ~{est_tokens} tokens "
@@ -177,10 +219,16 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     done = {}
     if os.path.exists(partial_path):
         prev = pd.read_csv(partial_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+        if list(prev.columns) != PARTIAL_COLUMNS:
+            raise SystemExit(f"Progress file {os.path.abspath(partial_path)} has an unexpected format "
+                             f"(made by another version). Move it away and run again.")
+        if len(prev) and set(prev["model_version"]) != {model_version}:
+            raise SystemExit(f"Progress file {os.path.abspath(partial_path)} was made with other model files. "
+                             f"Move it away and run again.")
         done = {int(r): True for r in prev["row"]}
         print(f"Resuming: {len(done)} of {n} rows already done in {partial_path}")
     else:
-        pd.DataFrame(columns=["row"] + OUT_COLUMNS).to_csv(partial_path, index=False, encoding="utf-8-sig")
+        pd.DataFrame(columns=PARTIAL_COLUMNS).to_csv(partial_path, index=False, encoding="utf-8-sig")
 
     pending = [i for i in range(n) if i not in done]
     if client is None and any(not empty.iloc[i] for i in pending):
@@ -205,15 +253,14 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         for i in rows:
             if i in results:
                 c, cc, p, pc = results[i]
-                nh, why = decide_human(cc, pc, False)
-                out_rows.append({"row": i, "category": c, "category_confidence": f"{cc:.3f}", "priority": p,
-                                 "priority_confidence": f"{pc:.3f}", "needs_human": nh,
-                                 "needs_human_reason": why, "model_version": model_version})
+                out_rows.append({"row": i, "category": c, "category_confidence": f"{cc:.10f}", "priority": p,
+                                 "priority_confidence": f"{pc:.10f}", "empty_text": "0",
+                                 "model_version": model_version})
             else:
                 out_rows.append({"row": i, "category": "", "category_confidence": "", "priority": "",
-                                 "priority_confidence": "", "needs_human": "yes",
-                                 "needs_human_reason": "empty_text", "model_version": model_version})
-        pd.DataFrame(out_rows).to_csv(partial_path, mode="a", header=False, index=False, encoding="utf-8-sig")
+                                 "priority_confidence": "", "empty_text": "1", "model_version": model_version})
+        pd.DataFrame(out_rows, columns=PARTIAL_COLUMNS).to_csv(partial_path, mode="a", header=False, index=False,
+                                                               encoding="utf-8-sig")
         print(f"  {min(start + batch_size, len(pending))}/{len(pending)} rows done")
 
     # Merge and hard completeness check.
@@ -222,6 +269,14 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     part = part.drop_duplicates("row", keep="last").set_index("row").sort_index()
     if len(part) != n or list(part.index) != list(range(n)):
         raise SystemExit(f"INCOMPLETE: {len(part)} of {n} rows have results. Run the same command again.")
+    decisions = [decide_human(float(r.category_confidence) if r.category_confidence else 0.0,
+                              float(r.priority_confidence) if r.priority_confidence else 0.0,
+                              r.empty_text == "1", min_category, min_priority)
+                 for r in part.itertuples()]
+    part["needs_human"] = [d[0] for d in decisions]
+    part["needs_human_reason"] = [d[1] for d in decisions]
+    for col in ("category_confidence", "priority_confidence"):
+        part[col] = [f"{float(v):.4f}" if v else "" for v in part[col]]
     out = pd.concat([df.reset_index(drop=True), part[OUT_COLUMNS].reset_index(drop=True)], axis=1)
     tmp = output_path + ".tmp"
     out.to_csv(tmp, index=False, encoding="utf-8-sig")
@@ -251,8 +306,13 @@ def main(argv=None):
     ap.add_argument("--models-dir", default=MODELS_DIR_DEFAULT, help="folder with the two .joblib files")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--dry-run", action="store_true", help="check the file and print the size, no API calls")
+    ap.add_argument("--min-category-confidence", type=float, default=MIN_CATEGORY_CONFIDENCE,
+                    help=f"tickets below this category confidence go to a human (default {MIN_CATEGORY_CONFIDENCE})")
+    ap.add_argument("--min-priority-confidence", type=float, default=MIN_PRIORITY_CONFIDENCE,
+                    help="also send tickets below this priority confidence to a human (default: not used)")
     a = ap.parse_args(argv)
-    run(a.input, a.output, a.models_dir, a.batch_size, a.dry_run)
+    run(a.input, a.output, a.models_dir, a.batch_size, a.dry_run,
+        min_category=a.min_category_confidence, min_priority=a.min_priority_confidence)
 
 
 if __name__ == "__main__":
