@@ -30,6 +30,7 @@ Known limits (see README): the classifiers were trained on English customer-supp
 five companies, with eight fixed categories; accuracy on other data is not known.
 """
 import argparse
+import csv
 import hashlib
 import os
 import re
@@ -205,9 +206,16 @@ def detect_delimiter(path, encoding):
     except UnicodeDecodeError:
         raise SystemExit(f"The input file is not readable as {encoding}. Save it as UTF-8 (in Excel: Save As > "
                          f"CSV UTF-8) or pass --encoding (for example --encoding cp1251).")
-    counts = {d: header.count(d) for d in (",", ";", "\t")}
-    best = max(counts, key=lambda d: (counts[d], d == ","))
-    return best if counts[best] > 0 else ","
+    # Count fields the way a CSV reader does (a separator inside quotes does not count). A separator that
+    # makes a column called "text" wins; otherwise the one giving the most columns; ties go to the comma.
+    fields = {}
+    for d in (",", ";", "\t"):
+        try:
+            fields[d] = next(csv.reader([header], delimiter=d))
+        except (csv.Error, StopIteration):
+            fields[d] = [header]
+    has_text = {d: any(f.strip().lower() == "text" for f in fields[d]) for d in fields}
+    return max(fields, key=lambda d: (has_text[d], len(fields[d]), d == ","))
 
 
 def read_input(path, encoding="utf-8-sig"):
@@ -324,7 +332,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
             emb, tok = embed_batch(client, [cleaned.iloc[i] for i in live])
             tokens_used += tok
             norms = np.linalg.norm(emb, axis=1)
-            if emb.shape[1] != cat_bundle["classifier"].n_features_in_ - len(cat_bundle["ohe"].categories_[0]) \
+            if emb.shape[1] != cat_bundle["classifier"].n_features_in_ - sum(len(c) for c in cat_bundle["ohe"].categories_) \
                     or not np.allclose(norms, 1.0, atol=1e-3):
                 raise RuntimeError("Embeddings do not match the training setup (size or unit length). "
                                    "Nothing from this batch was saved.")
