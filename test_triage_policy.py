@@ -38,6 +38,7 @@ class Fake:
         self.fail_from_call = fail_from_call
 
     def embed(self, texts, model, input_type):
+        assert model == triage.VOYAGE_MODEL and input_type == "document", (model, input_type)
         self.calls += 1
         if self.fail_from_call is not None and self.calls >= self.fail_from_call:
             raise ConnectionError("simulated outage")
@@ -155,6 +156,172 @@ check("7 dry run", res is None and not os.path.exists(out7) and not os.path.exis
 # 8. command line parsing
 triage.main([inp, "--output", os.path.join(work, "o8.csv"), "--models-dir", MODELS, "--dry-run",
              "--min-category-confidence", "0.8", "--min-priority-confidence", "0.5"])
+
+
+# 9. a progress file must not be reused for another input file with the same number of rows
+out9 = os.path.join(work, "o9.csv")
+try:
+    triage.run(inp, out9, MODELS, batch_size=16, client=Fake(fail_from_call=2))
+except RuntimeError:
+    pass
+df2 = df.copy()
+df2["text"] = [t + " (different ticket)" if t else t for t in df["text"]]
+inp2 = os.path.join(work, "in_other.csv")
+df2.to_csv(inp2, index=False)
+try:
+    triage.run(inp2, out9, MODELS, batch_size=16, client=Fake())
+    check("9 other input with same progress file must be refused", False)
+except SystemExit as e:
+    check("9 other input with same progress file refused", "different input" in str(e))
+
+# 10. embeddings that are not unit length stop the run before anything is saved
+class NonUnit(Fake):
+    def embed(self, texts, model, input_type):
+        r = super().embed(texts, model, input_type)
+        r.embeddings = [[2 * x for x in e] for e in r.embeddings]
+        return r
+out10 = os.path.join(work, "o10.csv")
+try:
+    triage.run(inp, out10, MODELS, client=NonUnit())
+    check("10 non-unit embeddings refused", False)
+except RuntimeError:
+    check("10 non-unit embeddings refused", True)
+check("10 nothing saved from the bad batch", len(pd.read_csv(out10 + ".partial.csv")) == 0)
+
+# 11. confidence survives saving exactly (no flip at the threshold)
+x = 0.69999999999
+check("11 repr round trip exact", float(repr(x)) == x)
+check("11 value just below threshold goes to a human", triage.decide_human(float(repr(x)), 0.0, False, 0.70, None)[0] == "yes")
+
+# 12. final check catches a blank category for a non-empty ticket
+orig_predict = triage.predict
+def broken_predict(emb, comps, bundle, m):
+    labels, conf = orig_predict(emb, comps, bundle, m)
+    labels[0] = ""
+    return labels, conf
+triage.predict = broken_predict
+try:
+    triage.run(inp, os.path.join(work, "o12.csv"), MODELS, batch_size=64, client=Fake())
+    check("12 blank category caught", False)
+except SystemExit as e:
+    check("12 blank category caught", "INCOMPLETE" in str(e))
+finally:
+    triage.predict = orig_predict
+
+# 13. input and parameter guards
+def refused(fn, needle):
+    try:
+        fn()
+        return False
+    except SystemExit as e:
+        return needle in str(e)
+check("13 batch size 0", refused(lambda: triage.run(inp, os.path.join(work, "o13.csv"), MODELS, batch_size=0, client=Fake()), "batch-size"))
+check("13 output equals input", refused(lambda: triage.run(inp, inp, MODELS, client=Fake()), "must not be the input"))
+check("13 category threshold None", refused(lambda: triage.run(inp, os.path.join(work, "o13b.csv"), MODELS, client=Fake(), min_category=None), "required"))
+empty_in = os.path.join(work, "empty.csv")
+pd.DataFrame({"text": []}).to_csv(empty_in, index=False)
+check("13 empty file, also in dry run", refused(lambda: triage.run(empty_in, dry_run=True), "no rows"))
+bad_enc = os.path.join(work, "latin.csv")
+with open(bad_enc, "wb") as f:
+    f.write("text\ncaf\xe9 problem\n".encode("latin-1"))
+check("13 not UTF-8 file", refused(lambda: triage.run(bad_enc, dry_run=True), "UTF-8"))
+corrupt = os.path.join(work, "o13c.csv")
+with open(corrupt + ".partial.csv", "w", encoding="utf-8") as f:
+    f.write('row,text_hash\n"1,2\n')
+check("13 damaged progress file", refused(lambda: triage.run(inp, corrupt, MODELS, client=Fake()), "damaged"))
+
+# 14. duplicated ids give a warning, blank-space company equals the default company
+import io, contextlib
+dup = df.copy()
+dup["id"] = 1
+dup_in = os.path.join(work, "dup.csv")
+dup.to_csv(dup_in, index=False)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(dup_in, os.path.join(work, "o14.csv"), MODELS, client=Fake())
+check("14 duplicated id warning", "duplicated values in the 'id' column" in buf.getvalue())
+sp = pd.DataFrame({"text": ["my order is late please help"] * 2, "company": ["   ", "unknown"]})
+sp_in = os.path.join(work, "sp.csv")
+sp.to_csv(sp_in, index=False)
+triage.run(sp_in, os.path.join(work, "o14b.csv"), MODELS, client=Fake())
+rs = pd.read_csv(os.path.join(work, "o14b.csv"), dtype=str, keep_default_na=False)
+check("14 blank company treated as the default company", rs.loc[0, "category_confidence"] == rs.loc[1, "category_confidence"])
+
+# 15. separators, column names, encoding (v4)
+base = pd.DataFrame({"id": [1, 2, 3], "text": ["my order is late, please help; thanks", "app crashes\nsecond line", 'he said "refund"'],
+                     "company": ["Delta", "Delta", "Delta"]})
+def run_quiet(*a, **k):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return triage.run(*a, **k)
+ref_out = os.path.join(work, "o15ref.csv")
+run_quiet(inp, ref_out, MODELS, client=Fake())
+for name, sep in (("semi", ";"), ("tab", "\t")):
+    fi = os.path.join(work, f"{name}.csv")
+    base.to_csv(fi, index=False, sep=sep, encoding="utf-8-sig")
+    fo = os.path.join(work, f"{name}_out.csv")
+    run_quiet(fi, fo, MODELS, client=Fake())
+    rr = pd.read_csv(fo, dtype=str, keep_default_na=False, sep=sep, encoding="utf-8-sig")
+    check(f"15 {name} separator kept in output", len(rr) == 3 and "needs_human" in rr.columns and list(rr["id"]) == ["1", "2", "3"])
+    check(f"15 {name} text with comma/newline/quote intact", list(rr["text"]) == list(base["text"]))
+weird = base.rename(columns={"text": " Text ", "company": "Company "})
+wi = os.path.join(work, "weird.csv"); weird.to_csv(wi, index=False)
+wo = os.path.join(work, "weird_out.csv")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(wi, wo, MODELS, client=Fake())
+rw = pd.read_csv(wo, dtype=str, keep_default_na=False)
+check("15 names with spaces/case accepted, own names kept", list(rw.columns[:3]) == [" Text ", "Company ", "id"] or " Text " in rw.columns)
+check("15 'Company ' recognised (not silently unknown)", "Company 'Company '" in buf.getvalue() or "Company column: 'Company '" in buf.getvalue())
+nc = os.path.join(work, "nocomp.csv"); base[["text"]].to_csv(nc, index=False)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(nc, os.path.join(work, "nocomp_out.csv"), MODELS, client=Fake())
+check("15 notice when no company column", "Company column: none" in buf.getvalue())
+dupn = os.path.join(work, "dupn.csv")
+with open(dupn, "w", encoding="utf-8") as f:
+    f.write("text, Text\na,b\n")
+check("15 duplicate names after normalisation refused", refused(lambda: triage.run(dupn, dry_run=True), "same"))
+clash = os.path.join(work, "clash.csv")
+pd.DataFrame({"text": ["a"], " Category ": ["x"]}).to_csv(clash, index=False)
+check("15 output column clash ignoring case/space", refused(lambda: triage.run(clash, dry_run=True), "overwrite"))
+cp = os.path.join(work, "cp1251.csv")
+with open(cp, "wb") as f:
+    f.write("text\nпроблема с заказом\n".encode("cp1251"))
+check("15 cp1251 without option gives hint", refused(lambda: triage.run(cp, dry_run=True), "--encoding"))
+cpo = os.path.join(work, "cp_out.csv")
+run_quiet(cp, cpo, MODELS, client=Fake(), encoding="cp1251")
+check("15 cp1251 with option works, output UTF-8", pd.read_csv(cpo, dtype=str, encoding="utf-8-sig").loc[0, "text"] == "проблема с заказом")
+
+# 16. retries: only temporary errors
+class Http(Exception):
+    def __init__(self, status):
+        super().__init__(f"http {status}")
+        self.http_status = status
+class AuthenticationError(Exception):
+    pass
+class Flaky(Fake):
+    def __init__(self, err, times):
+        super().__init__(); self.err = err; self.times = times; self.tries = 0
+    def embed(self, texts, model, input_type):
+        self.tries += 1
+        if self.tries <= self.times:
+            raise self.err
+        return super().embed(texts, model, input_type)
+for err, retriable in ((Http(429), True), (Http(503), True), (Http(401), False), (Http(400), False),
+                       (Http(422), False), (AuthenticationError("bad key"), False), (ConnectionError("net"), True)):
+    cl = Flaky(err, 1)
+    try:
+        triage.embed_batch(cl, ["hello there"])
+        got = cl.tries == 2
+    except RuntimeError:
+        got = cl.tries == 1
+    check(f"16 {type(err).__name__} {getattr(err, 'http_status', '')} retriable={retriable}", got == True and (cl.tries == 2) == retriable)
+cl = Flaky(Http(500), 99)
+try:
+    triage.embed_batch(cl, ["x"], max_attempts=3)
+    check("16 gives up after max attempts", False)
+except RuntimeError:
+    check("16 gives up after max attempts", cl.tries == 3)
 
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
