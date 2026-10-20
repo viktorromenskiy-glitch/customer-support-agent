@@ -24,12 +24,18 @@ Safety of long runs:
   command again and finished rows are not embedded (or paid for) twice;
 - the run is only complete when the output file has one result row per input row, otherwise it
   stops with an error;
+- two runs on the same output file at the same time are refused (<output>.lock; if a run was killed
+  and the next one says the lock exists, delete that file);
 - the absolute path of the result file is printed last.
 
 Known limits (see README): the classifiers were trained on English customer-support tweets of
 five companies, with eight fixed categories; accuracy on other data is not known.
+The output shows confidences with 4 decimals, but the decision uses the exact value, so a ticket shown
+as 0.7000 can still be passed to a human. When a run is finished the progress file is deleted: running
+again with another threshold embeds (and pays for) the tickets again.
 """
 import argparse
+import contextlib
 import csv
 import hashlib
 import os
@@ -43,6 +49,7 @@ import pandas as pd
 VOYAGE_MODEL = "voyage-4-lite"
 # The classifiers were trained on embeddings made with input_type="document"
 # (training/build_semantic_rag.py, training/embed_remaining_test_set.py), so the same type is used here.
+EMBED_DIM = 1024          # size of one embedding; both classifiers must expect exactly this plus the company encoding
 EMBED_INPUT_TYPE = "document"
 MODELS_DIR_DEFAULT = "."
 CATEGORY_MODEL_FILE = "category_classifier_embeddings.joblib"
@@ -103,6 +110,25 @@ def read_partial(path):
                          f"Move it away and run again (rows already paid for will be embedded again).")
 
 
+def validate_partial(prev, path):
+    """Stops when the progress file holds values this script could not have written (hand edits, damage)."""
+    def damaged(why):
+        raise SystemExit(f"Progress file {os.path.abspath(path)} is damaged ({why}). Move it away and run again "
+                         f"(rows already paid for will be embedded again).")
+    rows = pd.to_numeric(prev["row"], errors="coerce")
+    if rows.isna().any() or (rows % 1 != 0).any() or (rows < 0).any():
+        damaged("a row number is not a whole number")
+    if not prev["empty_text"].isin(["0", "1"]).all():
+        damaged("empty_text must be 0 or 1")
+    full = prev[prev["empty_text"] == "0"]
+    for col in ("category_confidence", "priority_confidence"):
+        v = pd.to_numeric(full[col], errors="coerce")
+        if v.isna().any() or ((v < 0) | (v > 1)).any():
+            damaged(f"{col} is not a number between 0 and 1")
+    if (full["category"] == "").any() or (full["priority"] == "").any():
+        damaged("an empty category or priority for a non-empty ticket")
+
+
 def file_digest(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()[:8]
@@ -121,6 +147,39 @@ def load_models(models_dir):
             raise FileNotFoundError(f"Model file not found: {os.path.abspath(p)}")
     version = f"{VOYAGE_MODEL}+LR cat:{file_digest(paths[0])} pri:{file_digest(paths[1])}"
     return joblib.load(paths[0]), joblib.load(paths[1]), version
+
+
+def check_models(cat_bundle, pri_bundle):
+    """Checks, before anything is paid for, that both classifiers expect EMBED_DIM numbers plus their own
+    company encoding. Stops with a clear message otherwise."""
+    for name, b in (("category", cat_bundle), ("priority", pri_bundle)):
+        if not isinstance(b, dict) or "ohe" not in b or "classifier" not in b:
+            raise SystemExit(f"The {name} model file does not have the expected content (ohe and classifier).")
+        dim = b["classifier"].n_features_in_ - sum(len(c) for c in b["ohe"].categories_)
+        if dim != EMBED_DIM:
+            raise SystemExit(f"The {name} model expects {dim} embedding numbers, this script produces {EMBED_DIM}. "
+                             f"Wrong model file?")
+
+
+@contextlib.contextmanager
+def run_lock(output_path):
+    """One run at a time per output file: a second run would write into the same progress file."""
+    path = output_path + ".lock"
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(f"Another run is using {os.path.abspath(output_path)} (lock file {os.path.abspath(path)} exists). "
+                         f"If no other run is active (for example the previous one was killed), delete the lock file "
+                         f"and run again.")
+    try:
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        yield
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def predict(embeddings, companies, bundle, ru_to_en):
@@ -207,7 +266,8 @@ def detect_delimiter(path, encoding):
         raise SystemExit(f"The input file is not readable as {encoding}. Save it as UTF-8 (in Excel: Save As > "
                          f"CSV UTF-8) or pass --encoding (for example --encoding cp1251).")
     # Count fields the way a CSV reader does (a separator inside quotes does not count). A separator that
-    # makes a column called "text" wins; otherwise the one giving the most columns; ties go to the comma.
+    # makes a column called "text" wins; otherwise the one giving the most columns; on a tie the comma wins
+    # (between ";" and tab, ";" wins).
     fields = {}
     for d in (",", ";", "\t"):
         try:
@@ -218,16 +278,44 @@ def detect_delimiter(path, encoding):
     return max(fields, key=lambda d: (has_text[d], len(fields[d]), d == ","))
 
 
+def check_field_counts(path, encoding, sep):
+    """Every record must have as many fields as the header. A line break inside a text without quotes, or a
+    missing separator, would otherwise cut one ticket into several rows without any error."""
+    csv.field_size_limit(10 ** 8)
+    bad = []
+    try:
+        with open(path, "r", encoding=encoding, newline="") as f:
+            reader = csv.reader(f, delimiter=sep)
+            header = next(reader, None)
+            if header is None:
+                return
+            for rec in reader:
+                if rec and len(rec) != len(header):
+                    bad.append((reader.line_num, len(rec)))
+    except UnicodeDecodeError:
+        return   # read_input reports the encoding problem
+    if bad:
+        first = ", ".join(f"line {ln} has {k}" for ln, k in bad[:5])
+        raise SystemExit(f"{len(bad)} row(s) do not have {len(header)} fields like the header ({first}). Usually a "
+                         f"line break inside a text that is not in quotes, or a missing or extra separator. "
+                         f"Fix the file and run again.")
+
+
 def read_input(path, encoding="utf-8-sig"):
     """Reads the input CSV. Returns (dataframe, separator, text_column, company_column, id_column).
 
     Column names are matched ignoring spaces and letter case ("Text", " company " work); the input columns
     keep their own names in the output. company_column / id_column are None when absent."""
     sep = detect_delimiter(path, encoding)
+    check_field_counts(path, encoding, sep)
     try:
         df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding=encoding, sep=sep)
     except UnicodeDecodeError:
         raise SystemExit(f"The input file is not readable as {encoding}. Save it as UTF-8 or pass --encoding.")
+    except pd.errors.EmptyDataError:
+        raise SystemExit("The input file is empty (no header line).")
+    except pd.errors.ParserError as e:
+        raise SystemExit(f"The input file cannot be read as a table: {str(e)[:150]}")
     names = {}
     for c in df.columns:
         key = str(c).strip().lower()
@@ -294,108 +382,114 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         print("Dry run: nothing was sent, no cost.")
         return None
     cat_bundle, pri_bundle, model_version = load_models(models_dir)
-    companies = (df[company_col] if company_col else pd.Series([DEFAULT_COMPANY] * n))
-    companies = companies.str.strip().replace("", DEFAULT_COMPANY)
-    hashes = [row_hash(cleaned.iloc[i], companies.iloc[i]) for i in range(n)]
+    check_models(cat_bundle, pri_bundle)
+    with run_lock(output_path):
+        companies = (df[company_col] if company_col else pd.Series([DEFAULT_COMPANY] * n))
+        companies = companies.str.strip().replace("", DEFAULT_COMPANY)
+        hashes = [row_hash(cleaned.iloc[i], companies.iloc[i]) for i in range(n)]
 
-    done = {}
-    if os.path.exists(partial_path):
-        prev = read_partial(partial_path)
-        if list(prev.columns) != PARTIAL_COLUMNS:
-            raise SystemExit(f"Progress file {os.path.abspath(partial_path)} has an unexpected format "
-                             f"(made by another version). Move it away and run again.")
-        if len(prev) and set(prev["model_version"]) != {model_version}:
-            raise SystemExit(f"Progress file {os.path.abspath(partial_path)} was made with other model files. "
-                             f"Move it away and run again.")
-        for r, h in zip(prev["row"], prev["text_hash"]):
-            if int(r) >= n or hashes[int(r)] != h:
-                raise SystemExit(f"Progress file {os.path.abspath(partial_path)} belongs to a different input file "
-                                 f"(row {r} does not match). Move it away or use another --output.")
-        done = {int(r): True for r in prev["row"]}
-        print(f"Resuming: {len(done)} of {n} rows already done in {partial_path}")
-    else:
-        pd.DataFrame(columns=PARTIAL_COLUMNS).to_csv(partial_path, index=False, encoding="utf-8-sig")
+        done = {}
+        if os.path.exists(partial_path):
+            prev = read_partial(partial_path)
+            if list(prev.columns) != PARTIAL_COLUMNS:
+                raise SystemExit(f"Progress file {os.path.abspath(partial_path)} has an unexpected format "
+                                 f"(made by another version). Move it away and run again.")
+            validate_partial(prev, partial_path)
+            if len(prev) and set(prev["model_version"]) != {model_version}:
+                raise SystemExit(f"Progress file {os.path.abspath(partial_path)} was made with other model files. "
+                                 f"Move it away and run again.")
+            for r, h in zip(prev["row"], prev["text_hash"]):
+                if int(r) >= n or hashes[int(r)] != h:
+                    raise SystemExit(f"Progress file {os.path.abspath(partial_path)} belongs to a different input file "
+                                     f"(row {r} does not match). Move it away or use another --output.")
+            done = {int(r): True for r in prev["row"]}
+            print(f"Resuming: {len(done)} of {n} rows already done in {partial_path}")
+        else:
+            pd.DataFrame(columns=PARTIAL_COLUMNS).to_csv(partial_path, index=False, encoding="utf-8-sig")
 
-    pending = [i for i in range(n) if i not in done]
-    if client is None and any(not empty.iloc[i] for i in pending):
-        if not os.environ.get("VOYAGE_API_KEY"):
-            raise SystemExit('VOYAGE_API_KEY is not set in this PowerShell window. Set it first: $env:VOYAGE_API_KEY="..."')
-        import voyageai
-        client = voyageai.Client()   # reads VOYAGE_API_KEY from the environment
+        pending = [i for i in range(n) if i not in done]
+        if client is None and any(not empty.iloc[i] for i in pending):
+            if not os.environ.get("VOYAGE_API_KEY"):
+                raise SystemExit('VOYAGE_API_KEY is not set in this PowerShell window. Set it first: $env:VOYAGE_API_KEY="..."')
+            import voyageai
+            client = voyageai.Client()   # reads VOYAGE_API_KEY from the environment
 
-    tokens_used = 0
-    for start in range(0, len(pending), batch_size):
-        rows = pending[start:start + batch_size]
-        live = [i for i in rows if not empty.iloc[i]]
-        results = {}
-        if live:
-            emb, tok = embed_batch(client, [cleaned.iloc[i] for i in live])
-            tokens_used += tok
-            norms = np.linalg.norm(emb, axis=1)
-            if emb.shape[1] != cat_bundle["classifier"].n_features_in_ - sum(len(c) for c in cat_bundle["ohe"].categories_) \
-                    or not np.allclose(norms, 1.0, atol=1e-3):
-                raise RuntimeError("Embeddings do not match the training setup (size or unit length). "
-                                   "Nothing from this batch was saved.")
-            cats, cat_conf = predict(emb, [companies.iloc[i] for i in live], cat_bundle, CATEGORY_RU_TO_EN)
-            pris, pri_conf = predict(emb, [companies.iloc[i] for i in live], pri_bundle, PRIORITY_RU_TO_EN)
-            for k, i in enumerate(live):
-                results[i] = (cats[k], float(cat_conf[k]), pris[k], float(pri_conf[k]))
-        out_rows = []
-        for i in rows:
-            if i in results:
-                c, cc, p, pc = results[i]
-                if not (np.isfinite(cc) and np.isfinite(pc)):
-                    raise RuntimeError(f"A classifier returned a non-finite confidence for row {i}. Nothing saved.")
-                out_rows.append({"row": i, "text_hash": hashes[i], "category": c, "category_confidence": repr(cc),
-                                 "priority": p, "priority_confidence": repr(pc), "empty_text": "0",
-                                 "model_version": model_version})
-            else:
-                out_rows.append({"row": i, "text_hash": hashes[i], "category": "", "category_confidence": "",
-                                 "priority": "", "priority_confidence": "", "empty_text": "1",
-                                 "model_version": model_version})
-        pd.DataFrame(out_rows, columns=PARTIAL_COLUMNS).to_csv(partial_path, mode="a", header=False, index=False,
-                                                               encoding="utf-8-sig")
-        print(f"  {min(start + batch_size, len(pending))}/{len(pending)} rows done")
+        tokens_used = 0
+        for start in range(0, len(pending), batch_size):
+            rows = pending[start:start + batch_size]
+            live = [i for i in rows if not empty.iloc[i]]
+            results = {}
+            if live:
+                emb, tok = embed_batch(client, [cleaned.iloc[i] for i in live])
+                tokens_used += tok
+                if emb.shape != (len(live), EMBED_DIM):
+                    raise RuntimeError(f"The service returned embeddings of shape {emb.shape}, expected "
+                                       f"({len(live)}, {EMBED_DIM}). Nothing from this batch was saved.")
+                norms = np.linalg.norm(emb, axis=1)
+                if not np.allclose(norms, 1.0, atol=1e-3):
+                    raise RuntimeError("Embeddings do not match the training setup (unit length). "
+                                       "Nothing from this batch was saved.")
+                cats, cat_conf = predict(emb, [companies.iloc[i] for i in live], cat_bundle, CATEGORY_RU_TO_EN)
+                pris, pri_conf = predict(emb, [companies.iloc[i] for i in live], pri_bundle, PRIORITY_RU_TO_EN)
+                for k, i in enumerate(live):
+                    results[i] = (cats[k], float(cat_conf[k]), pris[k], float(pri_conf[k]))
+            out_rows = []
+            for i in rows:
+                if i in results:
+                    c, cc, p, pc = results[i]
+                    if not (np.isfinite(cc) and np.isfinite(pc)):
+                        raise RuntimeError(f"A classifier returned a non-finite confidence for row {i}. Nothing saved.")
+                    out_rows.append({"row": i, "text_hash": hashes[i], "category": c, "category_confidence": repr(cc),
+                                     "priority": p, "priority_confidence": repr(pc), "empty_text": "0",
+                                     "model_version": model_version})
+                else:
+                    out_rows.append({"row": i, "text_hash": hashes[i], "category": "", "category_confidence": "",
+                                     "priority": "", "priority_confidence": "", "empty_text": "1",
+                                     "model_version": model_version})
+            pd.DataFrame(out_rows, columns=PARTIAL_COLUMNS).to_csv(partial_path, mode="a", header=False, index=False,
+                                                                   encoding="utf-8-sig")
+            print(f"  {min(start + batch_size, len(pending))}/{len(pending)} rows done")
 
-    # Merge and hard completeness check.
-    part = read_partial(partial_path)
-    part["row"] = part["row"].astype(int)
-    part = part.drop_duplicates("row", keep="last").set_index("row").sort_index()
-    if len(part) != n or list(part.index) != list(range(n)):
-        raise SystemExit(f"INCOMPLETE: {len(part)} of {n} rows have results. Run the same command again.")
-    decisions = [decide_human(float(r.category_confidence) if r.category_confidence else 0.0,
-                              float(r.priority_confidence) if r.priority_confidence else 0.0,
-                              r.empty_text == "1", min_category, min_priority)
-                 for r in part.itertuples()]
-    part["needs_human"] = [d[0] for d in decisions]
-    part["needs_human_reason"] = [d[1] for d in decisions]
-    for col in ("category_confidence", "priority_confidence"):
-        part[col] = [f"{float(v):.4f}" if v else "" for v in part[col]]
-    out = pd.concat([df.reset_index(drop=True), part[OUT_COLUMNS].reset_index(drop=True)], axis=1)
-    tmp = output_path + ".tmp"
-    out.to_csv(tmp, index=False, encoding="utf-8-sig", sep=sep)
-    os.replace(tmp, output_path)
-    check = pd.read_csv(output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig", sep=sep)
-    full = ~empty.reset_index(drop=True)
-    bad = (len(check) != n
-           or not check["needs_human"].isin(["yes", "no"]).all()
-           or (check.loc[full.values, ["category", "category_confidence", "priority", "priority_confidence"]] == "").any().any()
-           or (check["model_version"] == "").any())
-    if bad:
-        raise SystemExit("INCOMPLETE: the written file failed the final check. Do not use it.")
-    os.remove(partial_path)
+        # Merge and hard completeness check.
+        part = read_partial(partial_path)
+        validate_partial(part, partial_path)
+        part["row"] = part["row"].astype(int)
+        part = part.drop_duplicates("row", keep="last").set_index("row").sort_index()
+        if len(part) != n or list(part.index) != list(range(n)):
+            raise SystemExit(f"INCOMPLETE: {len(part)} of {n} rows have results. Run the same command again.")
+        decisions = [decide_human(float(r.category_confidence) if r.category_confidence else 0.0,
+                                  float(r.priority_confidence) if r.priority_confidence else 0.0,
+                                  r.empty_text == "1", min_category, min_priority)
+                     for r in part.itertuples()]
+        part["needs_human"] = [d[0] for d in decisions]
+        part["needs_human_reason"] = [d[1] for d in decisions]
+        for col in ("category_confidence", "priority_confidence"):
+            part[col] = [f"{float(v):.4f}" if v else "" for v in part[col]]
+        out = pd.concat([df.reset_index(drop=True), part[OUT_COLUMNS].reset_index(drop=True)], axis=1)
+        tmp = output_path + ".tmp"
+        out.to_csv(tmp, index=False, encoding="utf-8-sig", sep=sep)
+        os.replace(tmp, output_path)
+        check = pd.read_csv(output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig", sep=sep)
+        full = ~empty.reset_index(drop=True)
+        bad = (len(check) != n
+               or not check["needs_human"].isin(["yes", "no"]).all()
+               or (check.loc[full.values, ["category", "category_confidence", "priority", "priority_confidence"]] == "").any().any()
+               or (check["model_version"] == "").any())
+        if bad:
+            raise SystemExit("INCOMPLETE: the written file failed the final check. Do not use it.")
+        os.remove(partial_path)
 
-    print("\nSummary:")
-    print(check["needs_human"].value_counts().to_dict(), "(needs_human)")
-    if tokens_used:
-        print(f"Voyage tokens used in this run: {tokens_used} "
-              f"({tokens_used / max(1, len(pending) - int(empty.iloc[pending].sum())):.1f} per embedded ticket)")
-    print(f"Model version: {model_version}")
-    print("=" * 70)
-    print("RESULT FILE (absolute path):")
-    print(os.path.abspath(output_path))
-    print("=" * 70)
-    return os.path.abspath(output_path)
+        print("\nSummary:")
+        print(check["needs_human"].value_counts().to_dict(), "(needs_human)")
+        if tokens_used:
+            print(f"Voyage tokens used in this run: {tokens_used} "
+                  f"({tokens_used / max(1, len(pending) - int(empty.iloc[pending].sum())):.1f} per embedded ticket)")
+        print(f"Model version: {model_version}")
+        print("=" * 70)
+        print("RESULT FILE (absolute path):")
+        print(os.path.abspath(output_path))
+        print("=" * 70)
+        return os.path.abspath(output_path)
 
 
 def main(argv=None):
