@@ -46,7 +46,7 @@ MODELS_DIR_DEFAULT = "."
 CATEGORY_MODEL_FILE = "category_classifier_embeddings.joblib"
 PRIORITY_MODEL_FILE = "priority_classifier_embeddings.joblib"
 
-# Pass-to-human policy (chosen in plan step B3, see claude/triage-threshold-addendum-2026-10-20.md):
+# Pass-to-human policy (chosen in plan step B3 from held-out ticket experiments):
 # a ticket goes to a human when the category confidence (maximum class probability) is below
 # MIN_CATEGORY_CONFIDENCE. The priority confidence is only a hint unless --min-priority-confidence is given.
 # On held-out tickets (classifier trained on the first 12,000 of 20,000 tickets, labels set by a language
