@@ -323,6 +323,24 @@ try:
 except RuntimeError:
     check("16 gives up after max attempts", cl.tries == 3)
 
+# 17. delimiter detection ignores separators inside quotes
+def delim(content, name):
+    fp = os.path.join(work, name)
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(content)
+    return triage.detect_delimiter(fp, "utf-8-sig")
+check("17 ; file, comma inside quoted header name", delim('text;"notes, important"\nhi;x\n', "d1.csv") == ";")
+check("17 ; file, two commas in quoted name", delim('text;"a, b, c"\nhi;x\n', "d2.csv") == ";")
+check("17 tab file, comma in name", delim("text\tnotes, x\nhi\tz\n", "d3.csv") == "\t")
+check("17 comma file, semicolon inside quoted name", delim('text,"a;b;c;d"\nhi,x\n', "d4.csv") == ",")
+check("17 comma file plain", delim("id,text,company\n1,a,b\n", "d5.csv") == ",")
+check("17 single column", delim("text\nhello; world, yes\n", "d6.csv") == ",")
+d7 = os.path.join(work, "d7.csv")
+with open(d7, "w", encoding="utf-8") as f:
+    f.write('text;"notes, important"\nhello there;x, y\n')
+r7, sep7, tc7, _, _ = triage.read_input(d7)
+check("17 quoted-comma header parsed as 2 columns", sep7 == ";" and list(r7.columns) == ["text", "notes, important"] and r7.loc[0, "notes, important"] == "x, y")
+
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
 sys.exit(0 if fail == 0 else 1)
