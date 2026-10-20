@@ -204,7 +204,7 @@ try:
     triage.run(inp, os.path.join(work, "o12.csv"), MODELS, batch_size=64, client=Fake())
     check("12 blank category caught", False)
 except SystemExit as e:
-    check("12 blank category caught", "INCOMPLETE" in str(e))
+    check("12 blank category caught", "INCOMPLETE" in str(e) or "empty category" in str(e))
 finally:
     triage.predict = orig_predict
 
@@ -340,6 +340,83 @@ with open(d7, "w", encoding="utf-8") as f:
     f.write('text;"notes, important"\nhello there;x, y\n')
 r7, sep7, tc7, _, _ = triage.read_input(d7)
 check("17 quoted-comma header parsed as 2 columns", sep7 == ";" and list(r7.columns) == ["text", "notes, important"] and r7.loc[0, "notes, important"] == "x, y")
+
+# 18. checks added after the review of version 5
+import copy
+# 18a. empty / zero-byte input
+z = os.path.join(work, "zero.csv"); open(z, "w").close()
+check("18 zero-byte file", refused(lambda: triage.run(z, dry_run=True), "empty"))
+nl = os.path.join(work, "nl.csv"); open(nl, "w").write("\n\n")
+check("18 only line breaks", refused(lambda: triage.run(nl, dry_run=True), "empty"))
+# 18b. malformed records: unquoted line break, missing and extra separators
+bad1 = os.path.join(work, "bad1.csv"); open(bad1, "w", encoding="utf-8").write("id,text,company\n1,Hello\nworld,AppleSupport\n")
+check("18 unquoted line break refused", refused(lambda: triage.run(bad1, dry_run=True), "fields like the header"))
+bad2 = os.path.join(work, "bad2.csv"); open(bad2, "w", encoding="utf-8").write("id,text,company\n1,a,b,c,d\n")
+check("18 extra separators refused", refused(lambda: triage.run(bad2, dry_run=True), "fields like the header"))
+good = os.path.join(work, "good_q.csv"); open(good, "w", encoding="utf-8").write('id,text,company\n1,"Hello\nworld",Delta\n\n2,x,Delta\n')
+check("18 quoted line break and blank line accepted", triage.read_input(good)[0].shape[0] == 2)
+# 18c. model files that do not fit
+cat_b2, pri_b2, _ = triage.load_models(MODELS)
+check("18 matching models accepted", triage.check_models(cat_b2, pri_b2) is None)
+broken = copy.deepcopy(pri_b2)
+broken["classifier"].n_features_in_ = broken["classifier"].n_features_in_ + 1
+check("18 priority model with wrong size refused", refused(lambda: triage.check_models(cat_b2, broken), "priority model"))
+check("18 model dict without ohe refused", refused(lambda: triage.check_models({"classifier": 1}, pri_b2), "category model"))
+# 18d. progress file with values the script could not have written
+live_text = "my order is late please help me now"
+src = os.path.join(work, "src18.csv"); pd.DataFrame({"text": [live_text] * 3}).to_csv(src, index=False)
+ok_out = os.path.join(work, "ok18.csv"); run_quiet(src, ok_out, MODELS, client=Fake())
+mv = pd.read_csv(ok_out, dtype=str)["model_version"][0]
+hh = triage.row_hash(triage.clean(live_text), "unknown")
+def partial_case(tag, **over):
+    row = dict(row="0", text_hash=hh, category="Order status", category_confidence="0.9", priority="Low",
+               priority_confidence="0.9", empty_text="0", model_version=mv)
+    row.update(over)
+    o = os.path.join(work, f"p18_{tag}.csv")
+    pd.DataFrame([row]).to_csv(o + ".partial.csv", index=False)
+    return refused(lambda: triage.run(src, o, MODELS, client=Fake()), "damaged")
+check("18 row not a number", partial_case("a", row="abc"))
+check("18 negative row", partial_case("b", row="-1"))
+check("18 confidence not a number", partial_case("c", category_confidence="abc"))
+check("18 confidence nan", partial_case("d", category_confidence="nan"))
+check("18 confidence above 1", partial_case("e", priority_confidence="1.5"))
+check("18 empty_text value", partial_case("f", empty_text="maybe"))
+check("18 empty category for a real ticket", partial_case("g", category=""))
+# 18e. service returns the wrong number of embeddings
+class Empty(Fake):
+    def embed(self, texts, model, input_type):
+        r = super().embed(texts, model, input_type); r.embeddings = []; return r
+class Short(Fake):
+    def embed(self, texts, model, input_type):
+        r = super().embed(texts, model, input_type); r.embeddings = r.embeddings[:-1]; return r
+for cls in (Empty, Short):
+    try:
+        run_quiet(src, os.path.join(work, f"e18_{cls.__name__}.csv"), MODELS, client=cls())
+        check(f"18 {cls.__name__} embeddings refused", False)
+    except RuntimeError as e:
+        check(f"18 {cls.__name__} embeddings refused", "expected" in str(e))
+# 18f. only one run per output file
+lk = os.path.join(work, "lk18.csv")
+open(lk + ".lock", "w").write("123")
+check("18 existing lock refuses a second run", refused(lambda: triage.run(src, lk, MODELS, client=Fake()), "Another run"))
+check("18 lock of the other run is left alone", os.path.exists(lk + ".lock") and not os.path.exists(lk))
+os.remove(lk + ".lock")
+run_quiet(src, lk, MODELS, client=Fake())
+check("18 lock removed after a good run", not os.path.exists(lk + ".lock"))
+lk2 = os.path.join(work, "lk18b.csv")
+try:
+    run_quiet(src, lk2, MODELS, batch_size=1, client=Fake(fail_from_call=2))
+except RuntimeError:
+    pass
+check("18 lock removed after a failed run", not os.path.exists(lk2 + ".lock") and os.path.exists(lk2 + ".partial.csv"))
+run_quiet(src, lk2, MODELS, batch_size=1, client=Fake())
+check("18 failed run can be resumed", len(pd.read_csv(lk2, dtype=str)) == 3)
+# 18g. dry run does not take the lock
+run_quiet(src, os.path.join(work, "dry18.csv"), MODELS, dry_run=True)
+check("18 dry run leaves no lock", not os.path.exists(os.path.join(work, "dry18.csv.lock")))
+# 18h. separator tie between ';' and tab goes to ';'
+tie = os.path.join(work, "tie18.csv"); open(tie, "w").write("a;b\tc\n1;2\t3\n")
+check("18 tie semicolon vs tab", triage.detect_delimiter(tie, "utf-8-sig") == ";")
 
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
