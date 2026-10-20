@@ -10,7 +10,8 @@ Usage (PowerShell, from the project folder that holds the two .joblib model file
 A ticket goes to a human when the category confidence is below 0.70 (default). The priority is a
 hint unless --min-priority-confidence is given. See the comment at MIN_CATEGORY_CONFIDENCE.
 
-Input CSV: a required `text` column; optional `id` and `company`; any other columns are kept.
+Input CSV: a required `text` column; optional `id` and `company`; any other columns are kept. The separator
+(comma, semicolon or tab) is detected; column names are matched ignoring spaces and letter case.
 Output CSV: all input columns plus
     category, category_confidence, priority, priority_confidence,
     needs_human (yes/no), needs_human_reason, model_version
@@ -75,7 +76,7 @@ OUT_COLUMNS = ["category", "category_confidence", "priority", "priority_confiden
 # Columns of the progress file: raw model results only. The pass-to-human decision is made once,
 # at the end, from the full-precision confidences, so every row follows the same thresholds
 # even when a run is stopped and restarted with other thresholds.
-PARTIAL_COLUMNS = ["row", "category", "category_confidence", "priority", "priority_confidence",
+PARTIAL_COLUMNS = ["row", "text_hash", "category", "category_confidence", "priority", "priority_confidence",
                    "empty_text", "model_version"]
 
 
@@ -84,6 +85,21 @@ def clean(text):
     text = re.sub(r"@\w+", "", str(text))
     text = re.sub(r"https?://\S+", "", text)
     return text.strip()
+
+
+def row_hash(cleaned_text, company):
+    """Short fingerprint of what a result was computed from. Stored with every saved row, so a progress
+    file can never be reused for a different input file (the same row number but another ticket)."""
+    return hashlib.sha256(f"{company}\x1f{cleaned_text}".encode("utf-8")).hexdigest()[:12]
+
+
+def read_partial(path):
+    """Reads the progress file; stops with a clear message when it is damaged."""
+    try:
+        return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError) as e:
+        raise SystemExit(f"Progress file {os.path.abspath(path)} is damaged ({str(e)[:80]}). "
+                         f"Move it away and run again (rows already paid for will be embedded again).")
 
 
 def file_digest(path):
@@ -145,54 +161,112 @@ def decide_human(category_conf, priority_conf, empty, min_category=MIN_CATEGORY_
     return ("yes" if reasons else "no"), ";".join(reasons)
 
 
+# Errors that repeating the same request cannot fix (bad request, bad key): stop at once, no waiting.
+NOT_RETRIED_NAMES = {"AuthenticationError", "InvalidRequestError", "MalformedRequestError"}
+NOT_RETRIED_STATUS = {400, 401, 403, 404, 422}
+
+
+def is_retriable(error):
+    """True for temporary problems (timeouts, rate limits, 5xx, network); False when a retry cannot help."""
+    if type(error).__name__ in NOT_RETRIED_NAMES:
+        return False
+    return getattr(error, "http_status", None) not in NOT_RETRIED_STATUS
+
+
 def embed_batch(client, texts, max_attempts=5):
     """Embeds one batch with retries. Returns (embeddings array, tokens used).
 
+    Temporary errors are retried with growing waits; errors that a retry cannot fix stop the run at once.
+    Note: after a timeout the service may already have processed (and charged) the request, so a retry
+    can be charged again; this cannot be excluded from the client side.
+
     Raises:
-        RuntimeError: if all attempts fail (progress of earlier batches is already saved).
+        RuntimeError: if the error is not retriable or all attempts fail (progress of earlier batches is saved).
     """
     for attempt in range(1, max_attempts + 1):
         try:
             res = client.embed(texts, model=VOYAGE_MODEL, input_type=EMBED_INPUT_TYPE)
             return np.array(res.embeddings, dtype=float), int(getattr(res, "total_tokens", 0) or 0)
         except Exception as e:  # network, rate limit, ...
+            if not is_retriable(e):
+                raise RuntimeError(f"The service rejected the request and a retry cannot help: {str(e)[:200]}. "
+                                   f"Progress is saved; fix the cause and run the same command again.")
             wait = 25 * attempt
             print(f"  embedding error, attempt {attempt}/{max_attempts}: waiting {wait}s ({str(e)[:80]})")
             time.sleep(wait)
     raise RuntimeError("Embedding failed after all attempts. Progress is saved; run the same command again.")
 
 
-def read_input(path):
-    df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-    if "text" not in df.columns:
-        raise SystemExit(f"Input file must have a 'text' column. Found: {list(df.columns)}")
-    clash = [c for c in OUT_COLUMNS if c in df.columns]
+def detect_delimiter(path, encoding):
+    """Picks the column separator from the header line: comma, semicolon (Excel in many locales) or tab."""
+    try:
+        with open(path, "r", encoding=encoding, newline="") as f:
+            header = f.readline()
+    except UnicodeDecodeError:
+        raise SystemExit(f"The input file is not readable as {encoding}. Save it as UTF-8 (in Excel: Save As > "
+                         f"CSV UTF-8) or pass --encoding (for example --encoding cp1251).")
+    counts = {d: header.count(d) for d in (",", ";", "\t")}
+    best = max(counts, key=lambda d: (counts[d], d == ","))
+    return best if counts[best] > 0 else ","
+
+
+def read_input(path, encoding="utf-8-sig"):
+    """Reads the input CSV. Returns (dataframe, separator, text_column, company_column, id_column).
+
+    Column names are matched ignoring spaces and letter case ("Text", " company " work); the input columns
+    keep their own names in the output. company_column / id_column are None when absent."""
+    sep = detect_delimiter(path, encoding)
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding=encoding, sep=sep)
+    except UnicodeDecodeError:
+        raise SystemExit(f"The input file is not readable as {encoding}. Save it as UTF-8 or pass --encoding.")
+    names = {}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        if key in names:
+            raise SystemExit(f"Two columns are called the same after ignoring spaces and case: '{names[key]}' and '{c}'.")
+        names[key] = c
+    if "text" not in names:
+        raise SystemExit(f"Input file must have a 'text' column (separator detected: {sep!r}). Found: {list(df.columns)}")
+    clash = [c for c in df.columns if str(c).strip().lower() in OUT_COLUMNS]
     if clash:
         raise SystemExit(f"Input already has columns that the output would overwrite: {clash}. Rename them first.")
-    return df
+    return df, sep, names["text"], names.get("company"), names.get("id")
 
 
-def check_threshold(name, value):
-    """Stops with a clear message when a threshold is not a number between 0 and 1 (None is allowed for priority)."""
+def check_threshold(name, value, allow_none=False):
+    """Stops with a clear message when a threshold is not a number between 0 and 1."""
     if value is None:
-        return
+        if allow_none:
+            return
+        raise SystemExit(f"{name} is required (a number between 0 and 1)")
     if not (0.0 <= float(value) <= 1.0):
         raise SystemExit(f"{name} must be between 0 and 1, got {value}")
 
 
 def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=64, dry_run=False, client=None,
-        min_category=MIN_CATEGORY_CONFIDENCE, min_priority=MIN_PRIORITY_CONFIDENCE):
+        min_category=MIN_CATEGORY_CONFIDENCE, min_priority=MIN_PRIORITY_CONFIDENCE, encoding="utf-8-sig"):
     """Runs the whole triage. Returns the absolute path of the output file (None for a dry run).
 
     Args:
         min_category: tickets with category confidence below this go to a human.
         min_priority: tickets with priority confidence below this go to a human; None = priority is only a hint.
+        encoding: encoding of the input file (the output is always written as UTF-8 with a BOM, which Excel opens).
     """
     check_threshold("--min-category-confidence", min_category)
-    check_threshold("--min-priority-confidence", min_priority)
-    df = read_input(input_path)
+    check_threshold("--min-priority-confidence", min_priority, allow_none=True)
+    if batch_size < 1:
+        raise SystemExit(f"--batch-size must be at least 1, got {batch_size}")
+    df, sep, text_col, company_col, id_col = read_input(input_path, encoding)
+    if output_path is not None and os.path.abspath(output_path) == os.path.abspath(input_path):
+        raise SystemExit("--output must not be the input file (the input would be overwritten).")
+    if len(df) == 0:
+        raise SystemExit("Input has no rows.")
+    if id_col is not None and df[id_col].duplicated().any():
+        print(f"WARNING: {int(df[id_col].duplicated().sum())} duplicated values in the '{id_col}' column; "
+              f"rows are processed by position, ids are copied as they are.")
     n = len(df)
-    cleaned = df["text"].map(clean)
+    cleaned = df[text_col].map(clean)
     empty = cleaned.str.len() == 0
     if output_path is None:
         stem, _ = os.path.splitext(input_path)
@@ -200,7 +274,8 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     partial_path = output_path + ".partial.csv"
 
     print(f"Input: {os.path.abspath(input_path)}")
-    print(f"Rows: {n}  (empty after cleaning: {int(empty.sum())})")
+    print(f"Rows: {n}  (empty after cleaning: {int(empty.sum())}); separator {sep!r}, encoding {encoding}")
+    print("Company column: " + (f"'{company_col}'" if company_col else f"none, every row gets company '{DEFAULT_COMPANY}'"))
     print(f"Policy: to a human if category confidence < {min_category}"
           + (f" or priority confidence < {min_priority}" if min_priority is not None else " (priority is a hint only)"))
     to_embed_total = int((~empty).sum())
@@ -210,21 +285,24 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     if dry_run:
         print("Dry run: nothing was sent, no cost.")
         return None
-    if n == 0:
-        raise SystemExit("Input has no rows.")
-
     cat_bundle, pri_bundle, model_version = load_models(models_dir)
-    companies = (df["company"] if "company" in df.columns else pd.Series([DEFAULT_COMPANY] * n)).replace("", DEFAULT_COMPANY)
+    companies = (df[company_col] if company_col else pd.Series([DEFAULT_COMPANY] * n))
+    companies = companies.str.strip().replace("", DEFAULT_COMPANY)
+    hashes = [row_hash(cleaned.iloc[i], companies.iloc[i]) for i in range(n)]
 
     done = {}
     if os.path.exists(partial_path):
-        prev = pd.read_csv(partial_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+        prev = read_partial(partial_path)
         if list(prev.columns) != PARTIAL_COLUMNS:
             raise SystemExit(f"Progress file {os.path.abspath(partial_path)} has an unexpected format "
                              f"(made by another version). Move it away and run again.")
         if len(prev) and set(prev["model_version"]) != {model_version}:
             raise SystemExit(f"Progress file {os.path.abspath(partial_path)} was made with other model files. "
                              f"Move it away and run again.")
+        for r, h in zip(prev["row"], prev["text_hash"]):
+            if int(r) >= n or hashes[int(r)] != h:
+                raise SystemExit(f"Progress file {os.path.abspath(partial_path)} belongs to a different input file "
+                                 f"(row {r} does not match). Move it away or use another --output.")
         done = {int(r): True for r in prev["row"]}
         print(f"Resuming: {len(done)} of {n} rows already done in {partial_path}")
     else:
@@ -245,6 +323,11 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         if live:
             emb, tok = embed_batch(client, [cleaned.iloc[i] for i in live])
             tokens_used += tok
+            norms = np.linalg.norm(emb, axis=1)
+            if emb.shape[1] != cat_bundle["classifier"].n_features_in_ - len(cat_bundle["ohe"].categories_[0]) \
+                    or not np.allclose(norms, 1.0, atol=1e-3):
+                raise RuntimeError("Embeddings do not match the training setup (size or unit length). "
+                                   "Nothing from this batch was saved.")
             cats, cat_conf = predict(emb, [companies.iloc[i] for i in live], cat_bundle, CATEGORY_RU_TO_EN)
             pris, pri_conf = predict(emb, [companies.iloc[i] for i in live], pri_bundle, PRIORITY_RU_TO_EN)
             for k, i in enumerate(live):
@@ -253,18 +336,21 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         for i in rows:
             if i in results:
                 c, cc, p, pc = results[i]
-                out_rows.append({"row": i, "category": c, "category_confidence": f"{cc:.10f}", "priority": p,
-                                 "priority_confidence": f"{pc:.10f}", "empty_text": "0",
+                if not (np.isfinite(cc) and np.isfinite(pc)):
+                    raise RuntimeError(f"A classifier returned a non-finite confidence for row {i}. Nothing saved.")
+                out_rows.append({"row": i, "text_hash": hashes[i], "category": c, "category_confidence": repr(cc),
+                                 "priority": p, "priority_confidence": repr(pc), "empty_text": "0",
                                  "model_version": model_version})
             else:
-                out_rows.append({"row": i, "category": "", "category_confidence": "", "priority": "",
-                                 "priority_confidence": "", "empty_text": "1", "model_version": model_version})
+                out_rows.append({"row": i, "text_hash": hashes[i], "category": "", "category_confidence": "",
+                                 "priority": "", "priority_confidence": "", "empty_text": "1",
+                                 "model_version": model_version})
         pd.DataFrame(out_rows, columns=PARTIAL_COLUMNS).to_csv(partial_path, mode="a", header=False, index=False,
                                                                encoding="utf-8-sig")
         print(f"  {min(start + batch_size, len(pending))}/{len(pending)} rows done")
 
     # Merge and hard completeness check.
-    part = pd.read_csv(partial_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    part = read_partial(partial_path)
     part["row"] = part["row"].astype(int)
     part = part.drop_duplicates("row", keep="last").set_index("row").sort_index()
     if len(part) != n or list(part.index) != list(range(n)):
@@ -279,10 +365,15 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         part[col] = [f"{float(v):.4f}" if v else "" for v in part[col]]
     out = pd.concat([df.reset_index(drop=True), part[OUT_COLUMNS].reset_index(drop=True)], axis=1)
     tmp = output_path + ".tmp"
-    out.to_csv(tmp, index=False, encoding="utf-8-sig")
+    out.to_csv(tmp, index=False, encoding="utf-8-sig", sep=sep)
     os.replace(tmp, output_path)
-    check = pd.read_csv(output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-    if len(check) != n or (check["needs_human"] == "").any():
+    check = pd.read_csv(output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig", sep=sep)
+    full = ~empty.reset_index(drop=True)
+    bad = (len(check) != n
+           or not check["needs_human"].isin(["yes", "no"]).all()
+           or (check.loc[full.values, ["category", "category_confidence", "priority", "priority_confidence"]] == "").any().any()
+           or (check["model_version"] == "").any())
+    if bad:
         raise SystemExit("INCOMPLETE: the written file failed the final check. Do not use it.")
     os.remove(partial_path)
 
@@ -310,9 +401,11 @@ def main(argv=None):
                     help=f"tickets below this category confidence go to a human (default {MIN_CATEGORY_CONFIDENCE})")
     ap.add_argument("--min-priority-confidence", type=float, default=MIN_PRIORITY_CONFIDENCE,
                     help="also send tickets below this priority confidence to a human (default: not used)")
+    ap.add_argument("--encoding", default="utf-8-sig",
+                    help="encoding of the input file (default utf-8-sig; Excel files from some locales need cp1251)")
     a = ap.parse_args(argv)
     run(a.input, a.output, a.models_dir, a.batch_size, a.dry_run,
-        min_category=a.min_category_confidence, min_priority=a.min_priority_confidence)
+        min_category=a.min_category_confidence, min_priority=a.min_priority_confidence, encoding=a.encoding)
 
 
 if __name__ == "__main__":
