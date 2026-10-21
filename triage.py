@@ -408,6 +408,10 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     check_threshold("--min-priority-confidence", min_priority, allow_none=True)
     if max_auto_chars is not None and max_auto_chars < 1:
         raise SystemExit(f"--max-auto-chars must be at least 1, got {max_auto_chars}")
+    if max_auto_chars is not None and max_auto_chars > MAX_TEXT_CHARS:
+        raise SystemExit(f"--max-auto-chars must not exceed {MAX_TEXT_CHARS}, got {max_auto_chars}: only the first "
+                         f"{MAX_TEXT_CHARS} characters of a text are embedded, so a longer limit would classify texts "
+                         f"whose later part the classifier never saw.")
     if batch_size < 1:
         raise SystemExit(f"--batch-size must be at least 1, got {batch_size}")
     df, sep, text_col, company_col, id_col = read_input(input_path, encoding)
