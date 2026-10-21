@@ -7,9 +7,12 @@ Usage (PowerShell, from the project folder that holds the two .joblib model file
     python triage.py tickets.csv --overwrite    # replace an existing result file (embeds and pays again)
     python triage.py tickets.csv --min-category-confidence 0.8     # stricter: more tickets go to a human
     python triage.py tickets.csv --min-priority-confidence 0.6     # also use the priority confidence
+    python triage.py tickets.csv --max-auto-chars 1000             # longer texts always go to a human
 
 A ticket goes to a human when the category confidence is below 0.70 (default). The priority is a
-hint unless --min-priority-confidence is given. See the comment at MIN_CATEGORY_CONFIDENCE.
+hint unless --min-priority-confidence is given. Texts longer than --max-auto-chars (off by default) also go
+to a human: the classifiers were trained on short tweets (under 300 characters) and no accuracy
+measurement exists for long texts. See the comment at MIN_CATEGORY_CONFIDENCE.
 
 Input CSV: a required `text` column; optional `id` and `company`; any other columns are kept. The separator
 (comma, semicolon or tab) is detected; column names are matched ignoring spaces and letter case.
@@ -55,6 +58,7 @@ VOYAGE_MODEL = "voyage-4-lite"
 # (training/build_semantic_rag.py, training/embed_remaining_test_set.py), so the same type is used here.
 EMBED_DIM = 1024          # size of one embedding; both classifiers must expect exactly this plus the company encoding
 EMBED_INPUT_TYPE = "document"
+LONG_TEXT_NOTICE_CHARS = 1000   # the run prints how many texts are longer than this (all training texts were under 300)
 MAX_TEXT_CHARS = 8000     # longer cleaned texts are cut to this length before embedding (training texts were short tweets)
 MODELS_DIR_DEFAULT = "."
 CATEGORY_MODEL_FILE = "category_classifier_embeddings.joblib"
@@ -227,7 +231,7 @@ def predict(embeddings, companies, bundle, ru_to_en):
 
 
 def decide_human(category_conf, priority_conf, empty, min_category=MIN_CATEGORY_CONFIDENCE,
-                 min_priority=MIN_PRIORITY_CONFIDENCE):
+                 min_priority=MIN_PRIORITY_CONFIDENCE, too_long=False):
     """Returns (needs_human, reason). Reasons are joined with ';' when several apply.
 
     Args:
@@ -236,10 +240,13 @@ def decide_human(category_conf, priority_conf, empty, min_category=MIN_CATEGORY_
         empty: True when the ticket text is empty after cleaning (always goes to a human).
         min_category: below this category confidence the ticket goes to a human.
         min_priority: below this priority confidence the ticket goes to a human; None = not used.
+        too_long: True when the text is longer than --max-auto-chars (goes to a human).
     """
     if empty:
         return "yes", "empty_text"
     reasons = []
+    if too_long:
+        reasons.append("text_too_long")
     if category_conf < min_category:
         reasons.append("low_category_confidence")
     if min_priority is not None and priority_conf < min_priority:
@@ -368,7 +375,7 @@ def check_threshold(name, value, allow_none=False):
 
 def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=64, dry_run=False, client=None,
         min_category=MIN_CATEGORY_CONFIDENCE, min_priority=MIN_PRIORITY_CONFIDENCE, encoding="utf-8-sig",
-        overwrite=False):
+        overwrite=False, max_auto_chars=None):
     """Runs the whole triage. Returns the absolute path of the output file (None for a dry run).
 
     Args:
@@ -376,9 +383,12 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         min_priority: tickets with priority confidence below this go to a human; None = priority is only a hint.
         encoding: encoding of the input file (the output is always written as UTF-8 with a BOM, which Excel opens).
         overwrite: allow replacing an existing result file (the tickets are embedded and paid for again).
+        max_auto_chars: tickets whose cleaned text is longer than this go to a human; None = no length rule.
     """
     check_threshold("--min-category-confidence", min_category)
     check_threshold("--min-priority-confidence", min_priority, allow_none=True)
+    if max_auto_chars is not None and max_auto_chars < 1:
+        raise SystemExit(f"--max-auto-chars must be at least 1, got {max_auto_chars}")
     if batch_size < 1:
         raise SystemExit(f"--batch-size must be at least 1, got {batch_size}")
     df, sep, text_col, company_col, id_col = read_input(input_path, encoding)
@@ -404,7 +414,13 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     print(f"Rows: {n}  (empty after cleaning: {int(empty.sum())}); separator {sep!r}, encoding {encoding}")
     print("Company column: " + (f"'{company_col}'" if company_col else f"none, every row gets company '{DEFAULT_COMPANY}'"))
     print(f"Policy: to a human if category confidence < {min_category}"
-          + (f" or priority confidence < {min_priority}" if min_priority is not None else " (priority is a hint only)"))
+          + (f" or priority confidence < {min_priority}" if min_priority is not None else " (priority is a hint only)")
+          + (f"; or text longer than {max_auto_chars} characters" if max_auto_chars is not None else ""))
+    notice_long = int((cleaned.str.len() > LONG_TEXT_NOTICE_CHARS).sum())
+    if notice_long:
+        print(f"NOTE: {notice_long} text(s) are longer than {LONG_TEXT_NOTICE_CHARS} characters. The classifiers were trained on "
+              f"texts under 300 characters; their accuracy on longer texts is NOT verified. "
+              f"Use --max-auto-chars N to send longer texts to a human.")
     to_embed_total = int((~empty).sum())
     too_long = int((cleaned.str.len() > MAX_TEXT_CHARS).sum())
     if too_long:
@@ -490,10 +506,12 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         part = part.drop_duplicates("row", keep="last").set_index("row").sort_index()
         if len(part) != n or list(part.index) != list(range(n)):
             raise SystemExit(f"INCOMPLETE: {len(part)} of {n} rows have results. Run the same command again.")
+        lengths = cleaned.str.len().tolist()
         decisions = [decide_human(float(r.category_confidence) if r.category_confidence else 0.0,
                                   float(r.priority_confidence) if r.priority_confidence else 0.0,
-                                  r.empty_text == "1", min_category, min_priority)
-                     for r in part.itertuples()]
+                                  r.empty_text == "1", min_category, min_priority,
+                                  too_long=max_auto_chars is not None and lengths[k] > max_auto_chars)
+                     for k, r in enumerate(part.itertuples())]
         part["needs_human"] = [d[0] for d in decisions]
         part["needs_human_reason"] = [d[1] for d in decisions]
         for col in ("category_confidence", "priority_confidence"):
@@ -538,11 +556,15 @@ def main(argv=None):
                     help="also send tickets below this priority confidence to a human (default: not used)")
     ap.add_argument("--encoding", default="utf-8-sig",
                     help="encoding of the input file (default utf-8-sig; Excel files from some locales need cp1251)")
+    ap.add_argument("--max-auto-chars", type=int, default=None,
+                    help="tickets whose cleaned text is longer than this go to a human (default: no length rule; "
+                         "the classifiers were trained on texts under 300 characters)")
     ap.add_argument("--overwrite", action="store_true",
                     help="replace an existing result file (the tickets are embedded and paid for again)")
     a = ap.parse_args(argv)
     run(a.input, a.output, a.models_dir, a.batch_size, a.dry_run,
-        min_category=a.min_category_confidence, min_priority=a.min_priority_confidence, encoding=a.encoding, overwrite=a.overwrite)
+        min_category=a.min_category_confidence, min_priority=a.min_priority_confidence, encoding=a.encoding, overwrite=a.overwrite,
+        max_auto_chars=a.max_auto_chars)
 
 
 if __name__ == "__main__":
