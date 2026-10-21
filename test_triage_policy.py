@@ -418,6 +418,94 @@ check("18 dry run leaves no lock", not os.path.exists(os.path.join(work, "dry18.
 tie = os.path.join(work, "tie18.csv"); open(tie, "w").write("a;b\tc\n1;2\t3\n")
 check("18 tie semicolon vs tab", triage.detect_delimiter(tie, "utf-8-sig") == ";")
 
+# 19. checks added after the review of version 6
+# 19a. an existing result file is not replaced silently
+ow = os.path.join(work, "ow19.csv")
+run_quiet(src, ow, MODELS, client=Fake())
+before = open(ow, "rb").read()
+cl19 = Fake()
+check("19 repeated command refused", refused(lambda: triage.run(src, ow, MODELS, client=cl19), "already exists"))
+check("19 refused run changed nothing and embedded nothing", open(ow, "rb").read() == before and cl19.embedded == 0
+      and not os.path.exists(ow + ".lock") and not os.path.exists(ow + ".partial.csv"))
+check("19 dry run also refuses", refused(lambda: triage.run(src, ow, MODELS, dry_run=True), "already exists"))
+cl19b = Fake()
+run_quiet(src, ow, MODELS, client=cl19b, overwrite=True)
+check("19 --overwrite runs again", cl19b.embedded == 3 and os.path.exists(ow))
+# resume of a stopped run is still allowed even if an older result file is there
+ow2 = os.path.join(work, "ow19b.csv")
+open(ow2, "w").write("old result")
+try:
+    run_quiet(src, ow2, MODELS, batch_size=1, client=Fake(fail_from_call=2), overwrite=True)
+except RuntimeError:
+    pass
+cl19c = Fake()
+run_quiet(src, ow2, MODELS, batch_size=1, client=cl19c)
+check("19 stopped run resumes without --overwrite and replaces the old file", cl19c.embedded == 2 and len(pd.read_csv(ow2)) == 3)
+# command line
+ow3 = os.path.join(work, "ow19c.csv"); open(ow3, "w").write("x")
+check("19 CLI refuses existing output", refused(lambda: triage.main([src, "--output", ow3, "--models-dir", MODELS, "--dry-run"]), "already exists"))
+triage.main([src, "--output", ow3, "--models-dir", MODELS, "--dry-run", "--overwrite"])
+check("19 CLI --overwrite accepted", True)
+
+# 19b. progress file: duplicated rows and empty_text that does not match the input
+def partial_rows(tag, rows):
+    o = os.path.join(work, f"q19_{tag}.csv")
+    pd.DataFrame(rows).to_csv(o + ".partial.csv", index=False)
+    return o
+def prow(**over):
+    row = dict(row="0", text_hash=hh, category="Order status", category_confidence="0.9", priority="Low",
+               priority_confidence="0.9", empty_text="0", model_version=mv)
+    row.update(over); return row
+o = partial_rows("dup", [prow(), prow(category_confidence="0.8")])
+check("19 duplicated row numbers refused", refused(lambda: triage.run(src, o, MODELS, client=Fake()), "more than once"))
+o = partial_rows("emptymark", [prow(empty_text="1", category="", category_confidence="", priority="", priority_confidence="")])
+check("19 non-empty ticket marked empty refused", refused(lambda: triage.run(src, o, MODELS, client=Fake()), "empty_text does not match"))
+src_e = os.path.join(work, "src19e.csv"); pd.DataFrame({"text": ["@x http://t.co/a", live_text]}).to_csv(src_e, index=False)
+h_empty = triage.row_hash("", "unknown")
+o = partial_rows("emptyreal", [prow(text_hash=h_empty)])
+check("19 empty ticket marked as real refused", refused(lambda: triage.run(src_e, o, MODELS, client=Fake()), "empty_text does not match"))
+
+# 19c. long texts are cut before they are sent
+class Rec(Fake):
+    def __init__(self):
+        super().__init__(); self.longest = 0
+    def embed(self, texts, model, input_type):
+        self.longest = max([self.longest] + [len(x) for x in texts])
+        return super().embed(texts, model, input_type)
+src_l = os.path.join(work, "src19l.csv"); pd.DataFrame({"text": ["word " * 20000, live_text]}).to_csv(src_l, index=False)
+rec = Rec(); buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(src_l, os.path.join(work, "l19.csv"), MODELS, client=rec)
+check("19 long text cut to the limit", 0 < rec.longest <= triage.MAX_TEXT_CHARS)
+check("19 number of cut texts printed", "1 text(s) are longer" in buf.getvalue())
+rl = pd.read_csv(os.path.join(work, "l19.csv"), dtype=str, keep_default_na=False)
+check("19 long text still gets a result", rl.loc[0, "category"] != "" and len(rl) == 2)
+
+# 19d. models with classes this script does not know
+cat19, pri19, _ = triage.load_models(MODELS)
+bad_c = copy.deepcopy(cat19); bad_c["classifier"].classes_ = np.array(["Something else"] + list(bad_c["classifier"].classes_[1:]))
+check("19 unknown category class refused", refused(lambda: triage.check_models(bad_c, pri19), "classes this script does not"))
+bad_p = copy.deepcopy(pri19); bad_p["classifier"].classes_ = np.array(["Urgent"] + list(bad_p["classifier"].classes_[1:]))
+check("19 unknown priority class refused", refused(lambda: triage.check_models(cat19, bad_p), "classes this script does not"))
+
+# 19e. the real exception classes of the embedding client library
+try:
+    import voyageai.error as ve
+    for name, want in (("AuthenticationError", False), ("InvalidRequestError", False), ("MalformedRequestError", False),
+                       ("RateLimitError", True), ("ServerError", True), ("ServiceUnavailableError", True),
+                       ("Timeout", True), ("APIConnectionError", True)):
+        check(f"19 real {name} retriable={want}", triage.is_retriable(getattr(ve, name)("x")) == want)
+except ImportError:
+    print("   (voyageai not installed: real exception classes not tested)")
+
+# 19f. confidence just below the threshold survives saving, resuming and writing
+o = partial_rows("edge", [prow(category_confidence=repr(0.69999999999))])
+cl19e = Fake()
+run_quiet(src, o, MODELS, client=cl19e)
+re19 = pd.read_csv(o, dtype=str, keep_default_na=False)
+check("19 edge value: sent to a human, shown as 0.7000, other rows embedded", re19.loc[0, "needs_human"] == "yes"
+      and re19.loc[0, "category_confidence"] == "0.7000" and cl19e.embedded == 2)
+
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
 sys.exit(0 if fail == 0 else 1)
