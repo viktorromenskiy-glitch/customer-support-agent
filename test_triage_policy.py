@@ -622,6 +622,14 @@ check("21 waits only between attempts (2 waits for 3 attempts)", len(slept) == 2
 triage.time.sleep = lambda s: None
 check("21 status code as text is understood", not triage.is_retriable(Http("401")) and triage.is_retriable(Http("503")))
 
+# 22. a length limit above the embedded length is refused (review of version 8)
+check("22 --max-auto-chars above the cut length refused", refused(lambda: triage.run(src_m, os.path.join(work, "o22.csv"), MODELS, client=Fake(), max_auto_chars=triage.MAX_TEXT_CHARS + 1), "must not exceed"))
+run_quiet(src_m, os.path.join(work, "o22b.csv"), MODELS, client=Fake(), max_auto_chars=triage.MAX_TEXT_CHARS)
+check("22 --max-auto-chars equal to the cut length accepted", True)
+# 22b. rows made only of separators are kept (a blank-looking record is still a record)
+bl = os.path.join(work, "bl22.csv"); open(bl, "w").write("id,text,company\n1,,Delta\n,,\n2,x,Delta\n")
+check("22 record of empty fields is kept", len(triage.read_input(bl)[0]) == 3)
+
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
 sys.exit(0 if fail == 0 else 1)
