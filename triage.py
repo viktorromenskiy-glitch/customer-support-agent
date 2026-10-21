@@ -4,6 +4,7 @@ Ticket triage: CSV in -> same CSV out, with category, priority and a "pass to a 
 Usage (PowerShell, from the project folder that holds the two .joblib model files):
     python triage.py tickets.csv --dry-run      # checks the file, no API calls, no cost
     python triage.py tickets.csv                # writes tickets_triaged.csv next to the input
+    python triage.py tickets.csv --overwrite    # replace an existing result file (embeds and pays again)
     python triage.py tickets.csv --min-category-confidence 0.8     # stricter: more tickets go to a human
     python triage.py tickets.csv --min-priority-confidence 0.6     # also use the priority confidence
 
@@ -24,6 +25,8 @@ Safety of long runs:
   command again and finished rows are not embedded (or paid for) twice;
 - the run is only complete when the output file has one result row per input row, otherwise it
   stops with an error;
+- an existing result file is never replaced silently: a repeated command stops with a message (use
+  --overwrite or another --output on purpose);
 - two runs on the same output file at the same time are refused (<output>.lock; if a run was killed
   and the next one says the lock exists, delete that file);
 - the absolute path of the result file is printed last.
@@ -32,7 +35,8 @@ Known limits (see README): the classifiers were trained on English customer-supp
 five companies, with eight fixed categories; accuracy on other data is not known.
 The output shows confidences with 4 decimals, but the decision uses the exact value, so a ticket shown
 as 0.7000 can still be passed to a human. When a run is finished the progress file is deleted: running
-again with another threshold embeds (and pays for) the tickets again.
+again with another threshold embeds (and pays for) the tickets again. Texts longer than 8000 characters
+are cut to that length before embedding (the number of such texts is printed).
 """
 import argparse
 import contextlib
@@ -51,6 +55,7 @@ VOYAGE_MODEL = "voyage-4-lite"
 # (training/build_semantic_rag.py, training/embed_remaining_test_set.py), so the same type is used here.
 EMBED_DIM = 1024          # size of one embedding; both classifiers must expect exactly this plus the company encoding
 EMBED_INPUT_TYPE = "document"
+MAX_TEXT_CHARS = 8000     # longer cleaned texts are cut to this length before embedding (training texts were short tweets)
 MODELS_DIR_DEFAULT = "."
 CATEGORY_MODEL_FILE = "category_classifier_embeddings.joblib"
 PRIORITY_MODEL_FILE = "priority_classifier_embeddings.joblib"
@@ -118,6 +123,8 @@ def validate_partial(prev, path):
     rows = pd.to_numeric(prev["row"], errors="coerce")
     if rows.isna().any() or (rows % 1 != 0).any() or (rows < 0).any():
         damaged("a row number is not a whole number")
+    if rows.duplicated().any():
+        damaged("the same row number appears more than once")
     if not prev["empty_text"].isin(["0", "1"]).all():
         damaged("empty_text must be 0 or 1")
     full = prev[prev["empty_text"] == "0"]
@@ -127,6 +134,20 @@ def validate_partial(prev, path):
             damaged(f"{col} is not a number between 0 and 1")
     if (full["category"] == "").any() or (full["priority"] == "").any():
         damaged("an empty category or priority for a non-empty ticket")
+
+
+def check_partial_against_input(prev, hashes, empty, path):
+    """Every saved row must belong to this input: same row number, same text and company (fingerprint),
+    and the same empty/non-empty status."""
+    n = len(hashes)
+    for r, h, e in zip(prev["row"], prev["text_hash"], prev["empty_text"]):
+        i = int(r)
+        if i >= n or hashes[i] != h:
+            raise SystemExit(f"Progress file {os.path.abspath(path)} belongs to a different input file "
+                             f"(row {r} does not match). Move it away or use another --output.")
+        if (e == "1") != bool(empty.iloc[i]):
+            raise SystemExit(f"Progress file {os.path.abspath(path)} is damaged (row {r}: empty_text does not match "
+                             f"the input). Move it away and run again (rows already paid for will be embedded again).")
 
 
 def file_digest(path):
@@ -159,6 +180,11 @@ def check_models(cat_bundle, pri_bundle):
         if dim != EMBED_DIM:
             raise SystemExit(f"The {name} model expects {dim} embedding numbers, this script produces {EMBED_DIM}. "
                              f"Wrong model file?")
+        label_map = CATEGORY_RU_TO_EN if name == "category" else PRIORITY_RU_TO_EN
+        labels = {label_map.get(c, c) for c in b["classifier"].classes_}
+        if not labels <= set(label_map.values()):
+            raise SystemExit(f"The {name} model knows classes this script does not: "
+                             f"{sorted(labels - set(label_map.values()))}. Wrong model file?")
 
 
 @contextlib.contextmanager
@@ -341,13 +367,15 @@ def check_threshold(name, value, allow_none=False):
 
 
 def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=64, dry_run=False, client=None,
-        min_category=MIN_CATEGORY_CONFIDENCE, min_priority=MIN_PRIORITY_CONFIDENCE, encoding="utf-8-sig"):
+        min_category=MIN_CATEGORY_CONFIDENCE, min_priority=MIN_PRIORITY_CONFIDENCE, encoding="utf-8-sig",
+        overwrite=False):
     """Runs the whole triage. Returns the absolute path of the output file (None for a dry run).
 
     Args:
         min_category: tickets with category confidence below this go to a human.
         min_priority: tickets with priority confidence below this go to a human; None = priority is only a hint.
         encoding: encoding of the input file (the output is always written as UTF-8 with a BOM, which Excel opens).
+        overwrite: allow replacing an existing result file (the tickets are embedded and paid for again).
     """
     check_threshold("--min-category-confidence", min_category)
     check_threshold("--min-priority-confidence", min_priority, allow_none=True)
@@ -368,6 +396,9 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         stem, _ = os.path.splitext(input_path)
         output_path = stem + "_triaged.csv"
     partial_path = output_path + ".partial.csv"
+    if os.path.exists(output_path) and not os.path.exists(partial_path) and not overwrite:
+        raise SystemExit(f"The result file already exists: {os.path.abspath(output_path)}. Nothing was done. Use another "
+                         f"--output, or add --overwrite to replace it (the tickets are embedded and paid for again).")
 
     print(f"Input: {os.path.abspath(input_path)}")
     print(f"Rows: {n}  (empty after cleaning: {int(empty.sum())}); separator {sep!r}, encoding {encoding}")
@@ -375,7 +406,11 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     print(f"Policy: to a human if category confidence < {min_category}"
           + (f" or priority confidence < {min_priority}" if min_priority is not None else " (priority is a hint only)"))
     to_embed_total = int((~empty).sum())
-    est_tokens = int(cleaned[~empty].str.len().sum() / 4) + to_embed_total
+    too_long = int((cleaned.str.len() > MAX_TEXT_CHARS).sum())
+    if too_long:
+        print(f"NOTE: {too_long} text(s) are longer than {MAX_TEXT_CHARS} characters; only the first "
+              f"{MAX_TEXT_CHARS} characters are embedded.")
+    est_tokens = int(cleaned[~empty].str.slice(0, MAX_TEXT_CHARS).str.len().sum() / 4) + to_embed_total
     print(f"Rows to embed: {to_embed_total}; rough size estimate: ~{est_tokens} tokens "
           f"(character count / 4, an ESTIMATE, not a measurement)")
     if dry_run:
@@ -398,10 +433,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
             if len(prev) and set(prev["model_version"]) != {model_version}:
                 raise SystemExit(f"Progress file {os.path.abspath(partial_path)} was made with other model files. "
                                  f"Move it away and run again.")
-            for r, h in zip(prev["row"], prev["text_hash"]):
-                if int(r) >= n or hashes[int(r)] != h:
-                    raise SystemExit(f"Progress file {os.path.abspath(partial_path)} belongs to a different input file "
-                                     f"(row {r} does not match). Move it away or use another --output.")
+            check_partial_against_input(prev, hashes, empty, partial_path)
             done = {int(r): True for r in prev["row"]}
             print(f"Resuming: {len(done)} of {n} rows already done in {partial_path}")
         else:
@@ -420,7 +452,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
             live = [i for i in rows if not empty.iloc[i]]
             results = {}
             if live:
-                emb, tok = embed_batch(client, [cleaned.iloc[i] for i in live])
+                emb, tok = embed_batch(client, [cleaned.iloc[i][:MAX_TEXT_CHARS] for i in live])
                 tokens_used += tok
                 if emb.shape != (len(live), EMBED_DIM):
                     raise RuntimeError(f"The service returned embeddings of shape {emb.shape}, expected "
@@ -453,6 +485,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         # Merge and hard completeness check.
         part = read_partial(partial_path)
         validate_partial(part, partial_path)
+        check_partial_against_input(part, hashes, empty, partial_path)
         part["row"] = part["row"].astype(int)
         part = part.drop_duplicates("row", keep="last").set_index("row").sort_index()
         if len(part) != n or list(part.index) != list(range(n)):
@@ -505,9 +538,11 @@ def main(argv=None):
                     help="also send tickets below this priority confidence to a human (default: not used)")
     ap.add_argument("--encoding", default="utf-8-sig",
                     help="encoding of the input file (default utf-8-sig; Excel files from some locales need cp1251)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="replace an existing result file (the tickets are embedded and paid for again)")
     a = ap.parse_args(argv)
     run(a.input, a.output, a.models_dir, a.batch_size, a.dry_run,
-        min_category=a.min_category_confidence, min_priority=a.min_priority_confidence, encoding=a.encoding)
+        min_category=a.min_category_confidence, min_priority=a.min_priority_confidence, encoding=a.encoding, overwrite=a.overwrite)
 
 
 if __name__ == "__main__":
