@@ -630,6 +630,78 @@ check("22 --max-auto-chars equal to the cut length accepted", True)
 bl = os.path.join(work, "bl22.csv"); open(bl, "w").write("id,text,company\n1,,Delta\n,,\n2,x,Delta\n")
 check("22 record of empty fields is kept", len(triage.read_input(bl)[0]) == 3)
 
+# 23. checks added after the review of version 10
+# 23a. input and output name the same file (links; another letter case on Windows/macOS)
+in23 = os.path.join(work, "Tickets23.csv"); pd.DataFrame({"text": [live_text]}).to_csv(in23, index=False)
+hl = os.path.join(work, "hardlink23.csv"); os.link(in23, hl)
+check("23 hard link to the input refused as output", refused(lambda: triage.run(in23, hl, MODELS, client=Fake(), overwrite=True), "must not be the input"))
+orig_normcase = os.path.normcase
+os.path.normcase = lambda p: p.lower()
+try:
+    check("23 same name in another letter case refused (case-insensitive file system)",
+          refused(lambda: triage.run(in23, os.path.join(work, "tickets23.CSV"), MODELS, client=Fake(), overwrite=True), "must not be the input"))
+finally:
+    os.path.normcase = orig_normcase
+check("23 input file untouched", len(pd.read_csv(in23)) == 1 and "category" not in pd.read_csv(in23).columns)
+# 23b. a service answer that cannot be read is not repeated (it was already charged)
+class BadTokens(Fake):
+    def embed(self, texts, model, input_type):
+        r = super().embed(texts, model, input_type); r.total_tokens = "abc"; return r
+class BadVectors(Fake):
+    def embed(self, texts, model, input_type):
+        r = super().embed(texts, model, input_type); r.embeddings = [["x"]] * len(texts); return r
+for cls in (BadTokens, BadVectors):
+    cl = cls()
+    try:
+        triage.embed_batch(cl, ["hello there"])
+        check(f"23 {cls.__name__} stops", False)
+    except RuntimeError as e:
+        check(f"23 {cls.__name__} stops after one paid call", cl.calls == 1 and "NOT saved" in str(e))
+# 23c. exact duplicate column names in the header
+dc = os.path.join(work, "dupcol23.csv"); open(dc, "w").write("text,company,company\nhello there,Delta,Uber_Support\n")
+check("23 duplicate column names refused", refused(lambda: triage.run(dc, dry_run=True), "called the same"))
+# 23d. company encoder with another structure
+cat23, pri23, _ = triage.load_models(MODELS)
+bad_o = copy.deepcopy(cat23); bad_o["ohe"].handle_unknown = "error"
+check("23 encoder without handle_unknown=ignore refused", refused(lambda: triage.check_models(bad_o, pri23), "unexpected structure"))
+bad_o2 = copy.deepcopy(pri23); cats = list(bad_o2["ohe"].categories_[0]); bad_o2["ohe"].categories_ = [cats[:2], cats[2:]]
+check("23 encoder with two columns refused", refused(lambda: triage.check_models(cat23, bad_o2), "unexpected structure"))
+# 23e. a result that fails the final check does not replace an existing result
+fc = os.path.join(work, "fc23.csv"); open(fc, "w").write("old result")
+orig_decide = triage.decide_human
+triage.decide_human = lambda *a, **k: ("maybe", "")
+try:
+    check("23 failed final check reported", refused(lambda: triage.run(src, fc, MODELS, client=Fake(), overwrite=True), "NOT written"))
+finally:
+    triage.decide_human = orig_decide
+check("23 old result untouched, progress kept, no temporary file",
+      open(fc).read() == "old result" and os.path.exists(fc + ".partial.csv") and not os.path.exists(fc + ".tmp"))
+cl23 = Fake()
+run_quiet(src, fc, MODELS, client=cl23, overwrite=True)
+check("23 rerun rebuilds from the saved progress for free", cl23.embedded == 0 and len(pd.read_csv(fc)) == 3)
+# 23f. output is a folder: refused before anything is paid
+fd = os.path.join(work, "folder23"); os.mkdir(fd)
+cl23b = Fake()
+check("23 output folder refused", refused(lambda: triage.run(src, fd, MODELS, client=cl23b, overwrite=True), "folder") and cl23b.embedded == 0)
+# 23g. the long-text note counts only texts that are really embedded
+pu = os.path.join(work, "punct23.csv"); pd.DataFrame({"text": ["," * 9000, live_text]}).to_csv(pu, index=False)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(pu, os.path.join(work, "pu23.csv"), MODELS, client=Fake())
+check("23 punctuation-only long text not counted as cut", "longer than 8000" not in buf.getvalue())
+# 23h. a change after the embedded part does not invalidate saved results
+a_text = "word " * 3000
+src_h = os.path.join(work, "src23h.csv"); pd.DataFrame({"text": [a_text, live_text]}).to_csv(src_h, index=False)
+h_out = os.path.join(work, "h23.csv")
+try:
+    run_quiet(src_h, h_out, MODELS, batch_size=1, client=Fake(fail_from_call=2))
+except RuntimeError:
+    pass
+pd.DataFrame({"text": [a_text + " extra words at the very end", live_text]}).to_csv(src_h, index=False)
+cl23h = Fake()
+run_quiet(src_h, h_out, MODELS, batch_size=1, client=cl23h)
+check("23 tail change beyond the cut keeps saved results (only the missing row is embedded)", cl23h.embedded == 1)
+
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
 sys.exit(0 if fail == 0 else 1)
