@@ -195,6 +195,10 @@ def check_models(cat_bundle, pri_bundle):
         if dim != EMBED_DIM:
             raise SystemExit(f"The {name} model expects {dim} embedding numbers, this script produces {EMBED_DIM}. "
                              f"Wrong model file?")
+        ohe = b["ohe"]
+        if len(ohe.categories_) != 1 or getattr(ohe, "handle_unknown", None) != "ignore":
+            raise SystemExit(f"The {name} model's company encoder has an unexpected structure (one column and "
+                             f"handle_unknown='ignore' are expected). Wrong model file?")
         label_map = CATEGORY_RU_TO_EN if name == "category" else PRIORITY_RU_TO_EN
         labels = {label_map.get(c, c) for c in b["classifier"].classes_}
         if not labels <= set(label_map.values()):
@@ -295,7 +299,6 @@ def embed_batch(client, texts, max_attempts=5):
     for attempt in range(1, max_attempts + 1):
         try:
             res = client.embed(texts, model=VOYAGE_MODEL, input_type=EMBED_INPUT_TYPE)
-            return np.array(res.embeddings, dtype=float), int(getattr(res, "total_tokens", 0) or 0)
         except Exception as e:  # network, rate limit, ...
             if not is_retriable(e):
                 raise RuntimeError(f"The service rejected the request and a retry cannot help: {str(e)[:200]}. "
@@ -306,7 +309,25 @@ def embed_batch(client, texts, max_attempts=5):
             wait = 25 * attempt
             print(f"  embedding error, attempt {attempt}/{max_attempts}: waiting {wait}s ({str(e)[:80]})")
             time.sleep(wait)
+            continue
+        # The service has answered (and charged). A problem in reading the answer is not temporary:
+        # repeating the request would be charged again, so stop at once.
+        try:
+            return np.array(res.embeddings, dtype=float), int(getattr(res, "total_tokens", 0) or 0)
+        except (TypeError, ValueError, AttributeError) as e:
+            raise RuntimeError(f"The service answered, but its answer cannot be read ({str(e)[:100]}). This batch was "
+                               f"charged and NOT saved; repeating it would be charged again, so the run stops.")
     raise RuntimeError("Embedding failed after all attempts. Progress is saved; run the same command again.")
+
+
+def same_path(a, b):
+    """True when two paths name the same file, also with another letter case on Windows/macOS or through links."""
+    if os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b)):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def detect_delimiter(path, encoding):
@@ -341,6 +362,13 @@ def check_field_counts(path, encoding, sep):
             header = next(reader, None)
             if header is None:
                 return
+            seen = {}
+            for h in header:
+                key = h.strip().lower()
+                if key in seen:
+                    raise SystemExit(f"Two columns of the header are called the same (ignoring spaces and letter case): "
+                                     f"'{seen[key]}' and '{h}'. Rename one of them.")
+                seen[key] = h
             for rec in reader:
                 if rec and len(rec) != len(header):
                     bad.append((reader.line_num, len(rec)))
@@ -415,7 +443,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     if batch_size < 1:
         raise SystemExit(f"--batch-size must be at least 1, got {batch_size}")
     df, sep, text_col, company_col, id_col = read_input(input_path, encoding)
-    if output_path is not None and os.path.abspath(output_path) == os.path.abspath(input_path):
+    if output_path is not None and same_path(output_path, input_path):
         raise SystemExit("--output must not be the input file (the input would be overwritten).")
     if len(df) == 0:
         raise SystemExit("Input has no rows.")
@@ -429,6 +457,8 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         stem, _ = os.path.splitext(input_path)
         output_path = stem + "_triaged.csv"
     partial_path = output_path + ".partial.csv"
+    if os.path.isdir(output_path):
+        raise SystemExit(f"--output is a folder, not a file: {os.path.abspath(output_path)}")
     if os.path.exists(output_path) and not os.path.exists(partial_path) and not overwrite:
         raise SystemExit(f"The result file already exists: {os.path.abspath(output_path)}. Nothing was done. Use another "
                          f"--output, or add --overwrite to replace it (the tickets are embedded and paid for again).")
@@ -445,7 +475,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
               f"texts under 300 characters; their accuracy on longer texts is NOT verified. "
               f"Use --max-auto-chars N to send longer texts to a human.")
     to_embed_total = int((~empty).sum())
-    too_long = int((cleaned.str.len() > MAX_TEXT_CHARS).sum())
+    too_long = int(((cleaned.str.len() > MAX_TEXT_CHARS) & ~empty).sum())
     if too_long:
         print(f"NOTE: {too_long} text(s) are longer than {MAX_TEXT_CHARS} characters; only the first "
               f"{MAX_TEXT_CHARS} characters are embedded.")
@@ -460,7 +490,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
     with run_lock(output_path):
         companies = (df[company_col] if company_col else pd.Series([DEFAULT_COMPANY] * n))
         companies = companies.str.strip().replace("", DEFAULT_COMPANY)
-        hashes = [row_hash(cleaned.iloc[i], companies.iloc[i]) for i in range(n)]
+        hashes = [row_hash(cleaned.iloc[i][:MAX_TEXT_CHARS], companies.iloc[i]) for i in range(n)]   # what is embedded
         known_companies = set(cat_bundle["ohe"].categories_[0])
         unseen = sorted(set(companies) - known_companies)
         if unseen:
@@ -557,15 +587,17 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         out = pd.concat([df.reset_index(drop=True), part[OUT_COLUMNS].reset_index(drop=True)], axis=1)
         tmp = output_path + ".tmp"
         out.to_csv(tmp, index=False, encoding="utf-8-sig", sep=sep)
-        os.replace(tmp, output_path)
-        check = pd.read_csv(output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig", sep=sep)
+        check = pd.read_csv(tmp, dtype=str, keep_default_na=False, encoding="utf-8-sig", sep=sep)
         full = ~empty.reset_index(drop=True)
         bad = (len(check) != n
                or not check["needs_human"].isin(["yes", "no"]).all()
                or (check.loc[full.values, ["category", "category_confidence", "priority", "priority_confidence"]] == "").any().any()
                or (check["model_version"] == "").any())
         if bad:
-            raise SystemExit("INCOMPLETE: the written file failed the final check. Do not use it.")
+            os.remove(tmp)
+            raise SystemExit(f"INCOMPLETE: the result failed the final check and was NOT written to {output_path}; "
+                             f"an existing result file is untouched, the progress file is kept.")
+        os.replace(tmp, output_path)
         os.remove(partial_path)
 
         print("\nSummary:")
