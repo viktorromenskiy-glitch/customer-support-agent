@@ -506,6 +506,50 @@ re19 = pd.read_csv(o, dtype=str, keep_default_na=False)
 check("19 edge value: sent to a human, shown as 0.7000, other rows embedded", re19.loc[0, "needs_human"] == "yes"
       and re19.loc[0, "category_confidence"] == "0.7000" and cl19e.embedded == 2)
 
+# 20. optional rule: long texts go to a human (--max-auto-chars)
+check("20 decide_human: too_long adds its reason", triage.decide_human(0.99, 0.99, False, 0.70, None, too_long=True) == ("yes", "text_too_long"))
+check("20 decide_human: too_long plus low confidence", triage.decide_human(0.5, 0.99, False, 0.70, None, too_long=True) == ("yes", "text_too_long;low_category_confidence"))
+check("20 decide_human: empty text keeps its own reason", triage.decide_human(0.0, 0.0, True, 0.70, None, too_long=True) == ("yes", "empty_text"))
+check("20 decide_human: default unchanged", triage.decide_human(0.99, 0.99, False, 0.70, None) == ("no", ""))
+short_t = "my order is late please help me now"
+long_t = "my order is late please help me now " * 40          # 1440 characters
+exact_t = ("a" * 100)
+src_m = os.path.join(work, "src20.csv")
+pd.DataFrame({"text": [short_t, long_t, exact_t, ""]}).to_csv(src_m, index=False)
+o20 = os.path.join(work, "o20.csv"); buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(src_m, o20, MODELS, client=Fake())
+r20 = pd.read_csv(o20, dtype=str, keep_default_na=False)
+check("20 off by default: no text_too_long anywhere", not r20["needs_human_reason"].str.contains("text_too_long").any())
+check("20 notice about long text printed without the option", "1 text(s) are longer than 1000" in buf.getvalue()
+      and "NOT verified" in buf.getvalue())
+o20b = os.path.join(work, "o20b.csv"); buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(src_m, o20b, MODELS, client=Fake(), max_auto_chars=1000)
+r20b = pd.read_csv(o20b, dtype=str, keep_default_na=False)
+check("20 long text goes to a human with the reason", r20b.loc[1, "needs_human"] == "yes" and "text_too_long" in r20b.loc[1, "needs_human_reason"])
+check("20 short text not affected by the length rule", "text_too_long" not in r20b.loc[0, "needs_human_reason"])
+check("20 long text still has its category as a hint", r20b.loc[1, "category"] != "")
+check("20 policy line mentions the length rule", "longer than 1000 characters" in buf.getvalue())
+o20c = os.path.join(work, "o20c.csv")
+run_quiet(src_m, o20c, MODELS, client=Fake(), max_auto_chars=100)
+r20c = pd.read_csv(o20c, dtype=str, keep_default_na=False)
+check("20 text of exactly the limit is accepted, longer is not", "text_too_long" not in r20c.loc[2, "needs_human_reason"]
+      and "text_too_long" in r20c.loc[1, "needs_human_reason"])
+# a stopped run restarted with the rule: rows saved earlier follow the final setting
+o20d = os.path.join(work, "o20d.csv")
+try:
+    run_quiet(src_m, o20d, MODELS, batch_size=1, client=Fake(fail_from_call=3))
+except RuntimeError:
+    pass
+cl20 = Fake()
+run_quiet(src_m, o20d, MODELS, batch_size=1, client=cl20, max_auto_chars=1000)
+r20d = pd.read_csv(o20d, dtype=str, keep_default_na=False)
+check("20 resume applies the length rule to all rows", "text_too_long" in r20d.loc[1, "needs_human_reason"] and cl20.embedded < 3)
+check("20 invalid limit refused", refused(lambda: triage.run(src_m, os.path.join(work, "o20e.csv"), MODELS, client=Fake(), max_auto_chars=0), "at least 1"))
+triage.main([src_m, "--output", os.path.join(work, "o20f.csv"), "--models-dir", MODELS, "--dry-run", "--max-auto-chars", "500"])
+check("20 CLI --max-auto-chars accepted", True)
+
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
 sys.exit(0 if fail == 0 else 1)
