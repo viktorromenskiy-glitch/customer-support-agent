@@ -36,6 +36,8 @@ Safety of long runs:
 
 Known limits (see README): the classifiers were trained on English customer-support tweets of
 five companies, with eight fixed categories; accuracy on other data is not known.
+Paid results of a batch are lost (and paid again) if the process dies, or the answer fails the checks, between
+the service's reply and the progress write; identical texts in different rows are paid separately.
 The output shows confidences with 4 decimals, but the decision uses the exact value, so a ticket shown
 as 0.7000 can still be passed to a human. When a run is finished the progress file is deleted: running
 again with another threshold embeds (and pays for) the tickets again. Texts longer than 8000 characters
@@ -59,6 +61,7 @@ VOYAGE_MODEL = "voyage-4-lite"
 EMBED_DIM = 1024          # size of one embedding; both classifiers must expect exactly this plus the company encoding
 EMBED_INPUT_TYPE = "document"
 LONG_TEXT_NOTICE_CHARS = 1000   # the run prints how many texts are longer than this (all training texts were under 300)
+PREPROCESS_VERSION = "1"   # raise when clean() or the way texts are cut changes; part of model_version
 MAX_TEXT_CHARS = 8000     # longer cleaned texts are cut to this length before embedding (training texts were short tweets)
 MODELS_DIR_DEFAULT = "."
 CATEGORY_MODEL_FILE = "category_classifier_embeddings.joblib"
@@ -124,9 +127,9 @@ def validate_partial(prev, path):
     def damaged(why):
         raise SystemExit(f"Progress file {os.path.abspath(path)} is damaged ({why}). Move it away and run again "
                          f"(rows already paid for will be embedded again).")
-    rows = pd.to_numeric(prev["row"], errors="coerce")
-    if rows.isna().any() or (rows % 1 != 0).any() or (rows < 0).any():
+    if not prev["row"].str.fullmatch(r"\d+").all():
         damaged("a row number is not a whole number")
+    rows = pd.to_numeric(prev["row"])
     if rows.duplicated().any():
         damaged("the same row number appears more than once")
     if not prev["empty_text"].isin(["0", "1"]).all():
@@ -138,6 +141,13 @@ def validate_partial(prev, path):
             damaged(f"{col} is not a number between 0 and 1")
     if (full["category"] == "").any() or (full["priority"] == "").any():
         damaged("an empty category or priority for a non-empty ticket")
+    known_cat = set(CATEGORY_RU_TO_EN.values())
+    known_pri = set(PRIORITY_RU_TO_EN.values())
+    if not full["category"].isin(known_cat).all() or not full["priority"].isin(known_pri).all():
+        damaged("a category or priority that this script does not know")
+    blank = prev[prev["empty_text"] == "1"]
+    if (blank[["category", "category_confidence", "priority", "priority_confidence"]] != "").any().any():
+        damaged("results saved for a ticket that is empty")
 
 
 def check_partial_against_input(prev, hashes, empty, path):
@@ -170,7 +180,8 @@ def load_models(models_dir):
     for p in paths:
         if not os.path.exists(p):
             raise FileNotFoundError(f"Model file not found: {os.path.abspath(p)}")
-    version = f"{VOYAGE_MODEL}+LR cat:{file_digest(paths[0])} pri:{file_digest(paths[1])}"
+    version = (f"{VOYAGE_MODEL}+LR cat:{file_digest(paths[0])} pri:{file_digest(paths[1])} "
+               f"in:{EMBED_INPUT_TYPE} cut:{MAX_TEXT_CHARS} prep:{PREPROCESS_VERSION}")
     return joblib.load(paths[0]), joblib.load(paths[1]), version
 
 
@@ -263,7 +274,12 @@ def is_retriable(error):
     """True for temporary problems (timeouts, rate limits, 5xx, network); False when a retry cannot help."""
     if type(error).__name__ in NOT_RETRIED_NAMES:
         return False
-    return getattr(error, "http_status", None) not in NOT_RETRIED_STATUS
+    status = getattr(error, "http_status", None)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        pass
+    return status not in NOT_RETRIED_STATUS
 
 
 def embed_batch(client, texts, max_attempts=5):
@@ -284,6 +300,9 @@ def embed_batch(client, texts, max_attempts=5):
             if not is_retriable(e):
                 raise RuntimeError(f"The service rejected the request and a retry cannot help: {str(e)[:200]}. "
                                    f"Progress is saved; fix the cause and run the same command again.")
+            if attempt == max_attempts:
+                print(f"  embedding error, attempt {attempt}/{max_attempts}: giving up ({str(e)[:80]})")
+                break
             wait = 25 * attempt
             print(f"  embedding error, attempt {attempt}/{max_attempts}: waiting {wait}s ({str(e)[:80]})")
             time.sleep(wait)
@@ -401,7 +420,7 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
               f"rows are processed by position, ids are copied as they are.")
     n = len(df)
     cleaned = df[text_col].map(clean)
-    empty = cleaned.str.len() == 0
+    empty = ~cleaned.str.contains(r"\w", regex=True)   # nothing but spaces/punctuation counts as empty
     if output_path is None:
         stem, _ = os.path.splitext(input_path)
         output_path = stem + "_triaged.csv"
@@ -438,6 +457,12 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         companies = (df[company_col] if company_col else pd.Series([DEFAULT_COMPANY] * n))
         companies = companies.str.strip().replace("", DEFAULT_COMPANY)
         hashes = [row_hash(cleaned.iloc[i], companies.iloc[i]) for i in range(n)]
+        known_companies = set(cat_bundle["ohe"].categories_[0])
+        unseen = sorted(set(companies) - known_companies)
+        if unseen:
+            cnt = int((~companies.isin(known_companies)).sum())
+            print(f"NOTE: {cnt} row(s) have a company the model has not seen {unseen[:5]}: "
+                  f"the company part of their features is zero (the text still decides).")
 
         done = {}
         if os.path.exists(partial_path):
@@ -456,6 +481,12 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
             pd.DataFrame(columns=PARTIAL_COLUMNS).to_csv(partial_path, index=False, encoding="utf-8-sig")
 
         pending = [i for i in range(n) if i not in done]
+        if os.path.exists(output_path) and not overwrite and os.path.exists(partial_path):
+            if not pending:
+                raise SystemExit(f"A finished result ({os.path.abspath(output_path)}) and a complete progress file both exist: "
+                                 f"the previous run probably stopped at the very end. Nothing was done. Add --overwrite to "
+                                 f"rebuild the result from the saved progress (no new cost), or delete the progress file.")
+            print(f"NOTE: the existing file {os.path.abspath(output_path)} will be replaced when this run finishes.")
         if client is None and any(not empty.iloc[i] for i in pending):
             if not os.environ.get("VOYAGE_API_KEY"):
                 raise SystemExit('VOYAGE_API_KEY is not set in this PowerShell window. Set it first: $env:VOYAGE_API_KEY="..."')
@@ -501,6 +532,9 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         # Merge and hard completeness check.
         part = read_partial(partial_path)
         validate_partial(part, partial_path)
+        if set(part["model_version"]) != {model_version}:
+            raise SystemExit(f"Progress file {os.path.abspath(partial_path)} holds results of other model files or "
+                             f"settings. Move it away and run again.")
         check_partial_against_input(part, hashes, empty, partial_path)
         part["row"] = part["row"].astype(int)
         part = part.drop_duplicates("row", keep="last").set_index("row").sort_index()
