@@ -369,7 +369,7 @@ ok_out = os.path.join(work, "ok18.csv"); run_quiet(src, ok_out, MODELS, client=F
 mv = pd.read_csv(ok_out, dtype=str)["model_version"][0]
 hh = triage.row_hash(triage.clean(live_text), "unknown")
 def partial_case(tag, **over):
-    row = dict(row="0", text_hash=hh, category="Order status", category_confidence="0.9", priority="Low",
+    row = dict(row="0", text_hash=hh, category="Delivery / order status", category_confidence="0.9", priority="Low",
                priority_confidence="0.9", empty_text="0", model_version=mv)
     row.update(over)
     o = os.path.join(work, f"p18_{tag}.csv")
@@ -453,7 +453,7 @@ def partial_rows(tag, rows):
     pd.DataFrame(rows).to_csv(o + ".partial.csv", index=False)
     return o
 def prow(**over):
-    row = dict(row="0", text_hash=hh, category="Order status", category_confidence="0.9", priority="Low",
+    row = dict(row="0", text_hash=hh, category="Delivery / order status", category_confidence="0.9", priority="Low",
                priority_confidence="0.9", empty_text="0", model_version=mv)
     row.update(over); return row
 o = partial_rows("dup", [prow(), prow(category_confidence="0.8")])
@@ -549,6 +549,78 @@ check("20 resume applies the length rule to all rows", "text_too_long" in r20d.l
 check("20 invalid limit refused", refused(lambda: triage.run(src_m, os.path.join(work, "o20e.csv"), MODELS, client=Fake(), max_auto_chars=0), "at least 1"))
 triage.main([src_m, "--output", os.path.join(work, "o20f.csv"), "--models-dir", MODELS, "--dry-run", "--max-auto-chars", "500"])
 check("20 CLI --max-auto-chars accepted", True)
+
+# 21. checks added after the review of version 8
+# 21a. crash between writing the result and deleting the progress file
+import builtins
+cr_out = os.path.join(work, "cr21.csv")
+orig_remove = os.remove
+def killer(path):
+    if str(path).endswith(".partial.csv"):
+        raise KeyboardInterrupt("killed")
+    return orig_remove(path)
+os.remove = killer
+try:
+    run_quiet(src, cr_out, MODELS, client=Fake(), min_category=0.3)
+except KeyboardInterrupt:
+    pass
+finally:
+    os.remove = orig_remove
+check("21 crash left the result and a complete progress file", os.path.exists(cr_out) and os.path.exists(cr_out + ".partial.csv"))
+first = open(cr_out, "rb").read()
+cl21 = Fake()
+check("21 rerun with other threshold refused without --overwrite", refused(lambda: triage.run(src, cr_out, MODELS, client=cl21, min_category=0.99), "complete progress file"))
+check("21 refused rerun changed nothing, paid nothing", open(cr_out, "rb").read() == first and cl21.embedded == 0)
+run_quiet(src, cr_out, MODELS, client=cl21, min_category=0.99, overwrite=True)
+check("21 --overwrite rebuilds from the saved progress at no cost", cl21.embedded == 0 and not os.path.exists(cr_out + ".partial.csv")
+      and (pd.read_csv(cr_out, dtype=str)["needs_human"] == "yes").all())
+# 21b. notice when an unfinished run will replace an old file
+nt = os.path.join(work, "nt21.csv"); open(nt, "w").write("old")
+try:
+    run_quiet(src, nt, MODELS, batch_size=1, client=Fake(fail_from_call=2), overwrite=True)
+except RuntimeError:
+    pass
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(src, nt, MODELS, batch_size=1, client=Fake())
+check("21 notice that the old file will be replaced", "will be replaced when this run finishes" in buf.getvalue())
+# 21c. model_version carries the preprocessing settings
+check("21 model_version holds input type, cut length, preprocessing version",
+      all(x in mv for x in (f"in:{triage.EMBED_INPUT_TYPE}", f"cut:{triage.MAX_TEXT_CHARS}", f"prep:{triage.PREPROCESS_VERSION}")))
+check("21 progress made with other preprocessing settings refused",
+      refused(lambda: triage.run(src, partial_rows("prep", [prow(model_version=mv.replace("cut:", "cut:9"))]), MODELS, client=Fake()), "other model files"))
+# 21d. more progress-file damage
+check("21 row 1.0 refused with a clear message", partial_case("h", row="1.0"))
+check("21 row ' 1' refused", partial_case("i", row=" 1"))
+check("21 unknown category refused", partial_case("j", category="NotACategory"))
+check("21 unknown priority refused", partial_case("k", priority="Urgent"))
+o = partial_rows("blankfilled", [prow(text_hash=h_empty, empty_text="1")])
+check("21 results saved for an empty ticket refused", refused(lambda: triage.run(src_e, o, MODELS, client=Fake()), "damaged"))
+# 21e. text with nothing but punctuation counts as empty
+src_p = os.path.join(work, "src21p.csv")
+pd.DataFrame({"text": ["@user,", "  ...  ", "!!!", live_text]}).to_csv(src_p, index=False)
+cl21p = Fake()
+run_quiet(src_p, os.path.join(work, "p21.csv"), MODELS, client=cl21p)
+rp = pd.read_csv(os.path.join(work, "p21.csv"), dtype=str, keep_default_na=False)
+check("21 punctuation-only texts go to a human as empty, not embedded",
+      list(rp["needs_human_reason"][:3]) == ["empty_text"] * 3 and cl21p.embedded == 1)
+# 21f. unknown company is announced
+src_c = os.path.join(work, "src21c.csv")
+pd.DataFrame({"text": [live_text, live_text], "company": ["Acme", "Delta"]}).to_csv(src_c, index=False)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    triage.run(src_c, os.path.join(work, "c21.csv"), MODELS, client=Fake())
+check("21 unseen company announced", "1 row(s) have a company the model has not seen ['Acme']" in buf.getvalue())
+# 21g. no waiting after the last failed attempt, text status codes
+slept = []
+triage.time.sleep = lambda s: slept.append(s)
+try:
+    triage.embed_batch(Flaky(Http(500), 99), ["x"], max_attempts=3)
+except RuntimeError:
+    pass
+check("21 waits only between attempts (2 waits for 3 attempts)", len(slept) == 2)
+triage.time.sleep = lambda s: None
+check("21 status code as text is understood", not triage.is_retriable(Http("401")) and triage.is_retriable(Http("503")))
 
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
