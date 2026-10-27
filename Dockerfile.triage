@@ -1,0 +1,18 @@
+# CSV ticket triage (triage.py) - no knowledge base, no API server, no language-model key.
+# Build (from the project folder):   docker build -f Dockerfile.triage -t ticket-triage .
+# Check a file, no cost:             docker run --rm -v "%cd%":/data ticket-triage tickets.csv --dry-run
+# Real run (paid embeddings):        docker run --rm -e VOYAGE_API_KEY=... -v "%cd%":/data ticket-triage tickets.csv
+# (PowerShell: ${PWD} instead of %cd%; Linux/macOS: "$PWD".) The result is written next to the input file.
+# Offline tests, no key, no cost:    docker run --rm --entrypoint python ticket-triage /app/test_triage_policy.py /app
+FROM python:3.13-slim
+
+WORKDIR /app
+COPY requirements-triage.txt .
+RUN pip install --no-cache-dir -r requirements-triage.txt
+
+COPY triage.py test_triage_policy.py sample_tickets.csv ./
+COPY category_classifier_embeddings.joblib priority_classifier_embeddings.joblib ./
+
+# The folder with the client's CSV is mounted at /data; the key is passed at run time, never baked in.
+WORKDIR /data
+ENTRYPOINT ["python", "/app/triage.py", "--models-dir", "/app"]
