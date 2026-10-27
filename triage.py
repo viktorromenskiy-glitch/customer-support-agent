@@ -42,6 +42,8 @@ The output shows confidences with 4 decimals, but the decision uses the exact va
 as 0.7000 can still be passed to a human. When a run is finished the progress file is deleted: running
 again with another threshold embeds (and pays for) the tickets again. Texts longer than 8000 characters
 are cut to that length before embedding (the number of such texts is printed).
+The column separator is detected from the first physical line of the file: a header with a line break inside
+quotes is not supported.
 """
 import argparse
 import contextlib
@@ -201,9 +203,10 @@ def check_models(cat_bundle, pri_bundle):
                              f"handle_unknown='ignore' are expected). Wrong model file?")
         label_map = CATEGORY_RU_TO_EN if name == "category" else PRIORITY_RU_TO_EN
         labels = {label_map.get(c, c) for c in b["classifier"].classes_}
-        if not labels <= set(label_map.values()):
-            raise SystemExit(f"The {name} model knows classes this script does not: "
-                             f"{sorted(labels - set(label_map.values()))}. Wrong model file?")
+        expected = set(label_map.values())
+        if labels != expected:
+            raise SystemExit(f"The {name} model does not know exactly the expected classes: unknown to this script "
+                             f"{sorted(labels - expected)}, missing {sorted(expected - labels)}. Wrong model file?")
 
 
 @contextlib.contextmanager
@@ -314,7 +317,7 @@ def embed_batch(client, texts, max_attempts=5):
         # repeating the request would be charged again, so stop at once.
         try:
             return np.array(res.embeddings, dtype=float), int(getattr(res, "total_tokens", 0) or 0)
-        except (TypeError, ValueError, AttributeError) as e:
+        except (TypeError, ValueError, AttributeError, OverflowError) as e:
             raise RuntimeError(f"The service answered, but its answer cannot be read ({str(e)[:100]}). This batch was "
                                f"charged and NOT saved; repeating it would be charged again, so the run stops.")
     raise RuntimeError("Embedding failed after all attempts. Progress is saved; run the same command again.")
@@ -592,7 +595,9 @@ def run(input_path, output_path=None, models_dir=MODELS_DIR_DEFAULT, batch_size=
         bad = (len(check) != n
                or not check["needs_human"].isin(["yes", "no"]).all()
                or (check.loc[full.values, ["category", "category_confidence", "priority", "priority_confidence"]] == "").any().any()
-               or (check["model_version"] == "").any())
+               or (check["model_version"] == "").any()
+               or ((check["needs_human"] == "yes") & (check["needs_human_reason"] == "")).any()
+               or ((check["needs_human"] == "no") & (check["needs_human_reason"] != "")).any())
         if bad:
             os.remove(tmp)
             raise SystemExit(f"INCOMPLETE: the result failed the final check and was NOT written to {output_path}; "
