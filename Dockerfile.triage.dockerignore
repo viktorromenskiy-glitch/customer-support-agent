@@ -1,0 +1,8 @@
+# Only what triage.py needs goes into the image; everything else in the project folder is left out.
+*
+!triage.py
+!test_triage_policy.py
+!requirements-triage.txt
+!sample_tickets.csv
+!category_classifier_embeddings.joblib
+!priority_classifier_embeddings.joblib
