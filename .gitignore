@@ -29,3 +29,6 @@ voyage_key.txt
 .idea/
 .vscode/
 archive/
+# Exception: the two small classifiers needed by triage.py (68 KB and 35 KB)
+!/category_classifier_embeddings.joblib
+!/priority_classifier_embeddings.joblib
