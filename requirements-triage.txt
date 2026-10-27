@@ -1,0 +1,10 @@
+# Dependencies of triage.py (CSV triage tool). The full project (API, RAG agent) uses requirements.txt.
+# scikit-learn is pinned exactly: the two bundled model files are pickles saved with scikit-learn 1.9.1 and
+# are only guaranteed to load with that version.
+# Versions below are the ones the 162 offline tests were run with (Python 3.13); other versions are not tested.
+scikit-learn==1.9.1
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.14.1
+joblib==1.6.0
+voyageai==0.5.0
