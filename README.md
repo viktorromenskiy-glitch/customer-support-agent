@@ -2,6 +2,8 @@
 
 *[Русская версия](README_ru.md) · [Українська версія](README_uk.md)*
 
+**CSV triage tool (category, priority, pass-to-human flag): see [README_triage.md](README_triage.md).**
+
 A support-ticket automation system built on real public Twitter data (Apple, Amazon, Uber, Spotify, Delta — 20,000 real support requests). For each new ticket it classifies the ticket, retrieves semantically similar past resolutions, and decides whether to generate an automatic draft reply grounded in a real precedent or to escalate to a human.
 
 This is a portfolio project. It shows the full lifecycle: collecting and cleaning real (not synthetic) data, an honest empirical model choice, a working RAG pipeline, and an explicit list of real limitations instead of a polished but misleading demo.
