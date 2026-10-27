@@ -143,4 +143,4 @@ Python · scikit-learn · Voyage AI (эмбеддинги) · Anthropic Claude (
 
 ## Об авторе
 
-Виктор Роменский — GenAI/ML-инженер (RAG-системы, оценка LLM, fine-tuning). GitHub: [viktorromenskiy-glitch](https://github.com/viktorromenskiy-glitch) · LinkedIn: [профиль](https://www.linkedin.com/in/%D0%B2%D0%B8%D0%BA%D1%82%D0%BE%D1%80-%D1%80%D0%BE%D0%BC%D0%B5%D0%BD%D1%81%D0%BA%D0%B8%D0%B9-029b2086/) · Hugging Face: [ViktorPetrov123](https://huggingface.co/ViktorPetrov123) · Контакт: viktorromenskiy@gmail.com
+Виктор Роменский — GenAI/ML-инженер (RAG-системы, оценка LLM, fine-tuning). GitHub: [viktorromenskiy-glitch](https://github.com/viktorromenskiy-glitch)
