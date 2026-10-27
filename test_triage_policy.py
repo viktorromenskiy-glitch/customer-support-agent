@@ -202,9 +202,9 @@ def broken_predict(emb, comps, bundle, m):
 triage.predict = broken_predict
 try:
     triage.run(inp, os.path.join(work, "o12.csv"), MODELS, batch_size=64, client=Fake())
-    check("12 blank category caught", False)
+    check("12 blank category caught (by the progress check, before the final check)", False)
 except SystemExit as e:
-    check("12 blank category caught", "INCOMPLETE" in str(e) or "empty category" in str(e))
+    check("12 blank category caught (by the progress check, before the final check)", "damaged" in str(e) and "empty category" in str(e))
 finally:
     triage.predict = orig_predict
 
@@ -484,9 +484,9 @@ check("19 long text still gets a result", rl.loc[0, "category"] != "" and len(rl
 # 19d. models with classes this script does not know
 cat19, pri19, _ = triage.load_models(MODELS)
 bad_c = copy.deepcopy(cat19); bad_c["classifier"].classes_ = np.array(["Something else"] + list(bad_c["classifier"].classes_[1:]))
-check("19 unknown category class refused", refused(lambda: triage.check_models(bad_c, pri19), "classes this script does not"))
+check("19 unknown category class refused", refused(lambda: triage.check_models(bad_c, pri19), "unknown to this script"))
 bad_p = copy.deepcopy(pri19); bad_p["classifier"].classes_ = np.array(["Urgent"] + list(bad_p["classifier"].classes_[1:]))
-check("19 unknown priority class refused", refused(lambda: triage.check_models(cat19, bad_p), "classes this script does not"))
+check("19 unknown priority class refused", refused(lambda: triage.check_models(cat19, bad_p), "unknown to this script"))
 
 # 19e. the real exception classes of the embedding client library
 try:
@@ -701,6 +701,41 @@ pd.DataFrame({"text": [a_text + " extra words at the very end", live_text]}).to_
 cl23h = Fake()
 run_quiet(src_h, h_out, MODELS, batch_size=1, client=cl23h)
 check("23 tail change beyond the cut keeps saved results (only the missing row is embedded)", cl23h.embedded == 1)
+
+# 24. checks added after the review of version 11
+# 24a. a model that does not know all expected classes is refused before anything is paid
+import numpy as np
+cat24, pri24, _ = triage.load_models(MODELS)
+short = copy.deepcopy(cat24); clf = short["classifier"]
+keep = list(range(len(clf.classes_) - 1))
+clf.classes_ = clf.classes_[keep]; clf.coef_ = clf.coef_[keep]; clf.intercept_ = clf.intercept_[keep]
+check("24 category model with a missing class refused", refused(lambda: triage.check_models(short, pri24), "missing"))
+short_p = copy.deepcopy(pri24); clfp = short_p["classifier"]
+keepp = list(range(len(clfp.classes_) - 1))
+clfp.classes_ = clfp.classes_[keepp]; clfp.coef_ = clfp.coef_[keepp]; clfp.intercept_ = clfp.intercept_[keepp]
+check("24 priority model with a missing class refused", refused(lambda: triage.check_models(cat24, short_p), "missing"))
+# 24b. an unreadable service answer with an infinite token count stops with the prepared message
+class InfTokens(Fake):
+    def embed(self, texts, model, input_type):
+        r = super().embed(texts, model, input_type); r.total_tokens = float("inf"); return r
+cl24 = InfTokens()
+try:
+    triage.embed_batch(cl24, ["hello there"])
+    check("24 infinite token count stops", False)
+except RuntimeError as e:
+    check("24 infinite token count stops after one paid call with the prepared message", cl24.calls == 1 and "NOT saved" in str(e))
+# 24c. the final check refuses a flag that contradicts its reason (the result file is not written)
+for pair, label in ((("yes", ""), "yes without a reason"), (("no", "low_category_confidence"), "no with a reason")):
+    fc24 = os.path.join(work, "fc24.csv"); open(fc24, "w").write("old result")
+    orig_decide = triage.decide_human
+    triage.decide_human = lambda *a, _p=pair, **k: _p
+    try:
+        check(f"24 final check refuses {label}", refused(lambda: triage.run(src, fc24, MODELS, client=Fake(), overwrite=True), "NOT written"))
+    finally:
+        triage.decide_human = orig_decide
+    check(f"24 {label}: old result untouched, no temporary file", open(fc24).read() == "old result" and not os.path.exists(fc24 + ".tmp"))
+    for leftover in (fc24 + ".partial.csv",):
+        if os.path.exists(leftover): os.remove(leftover)
 
 shutil.rmtree(work)
 print(f"tests: {ok} passed, {fail} failed")
