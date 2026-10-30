@@ -2,7 +2,7 @@
 
 *[Русская версия](README_ru.md) · [Українська версія](README_uk.md)*
 
-**CSV triage tool (category, priority, pass-to-human flag): see [README_triage.md](README_triage.md).**
+**CSV triage tool (category, priority, pass-to-human flag): see [README_triage.md](README_triage.md).** The Results table below belongs to the earlier RAG pipeline (see "Limitations"); it measures agreement with language-model labels, not accuracy against human decisions.
 
 A support-ticket automation system built on real public Twitter data (Apple, Amazon, Uber, Spotify, Delta — 20,000 real support requests). For each new ticket it classifies the ticket, retrieves semantically similar past resolutions, and decides whether to generate an automatic draft reply grounded in a real precedent or to escalate to a human.
 
@@ -50,7 +50,7 @@ A single embedding call per ticket serves all three downstream tasks (two classi
 
 All metrics are measured on a **temporal** train/test split (the earliest 80% of tickets for training and the knowledge base, the latest 20% as a held-out test), not a random split. This avoids evaluating on data that "peeks from the future" and matches the real use case: searching already-solved tickets to help with a new one. The test set is the last 4,000 tickets, which cover 12 calendar days (22 Nov - 3 Dec 2017). How the models behave in other periods or at other companies has not been checked.
 
-Category and priority labels come from an LLM (Claude Haiku), not from manual labeling, because the source dataset has neither. This is a form of weak supervision / distillation: the LLM labels the whole dataset once, and a cheap, fast classical classifier (logistic regression) is trained on those labels for real-time use, instead of calling the LLM for every incoming ticket just to classify it. This also means that every accuracy figure here shows how closely the classifier agrees with the LLM labels, not how often it matches the decision of a human. A check on manually labeled tickets has not been done yet.
+Category and priority labels come from an LLM (Claude Haiku), not from manual labeling, because the source dataset has neither. This is a form of weak supervision / distillation: the LLM labels the whole dataset once, and a cheap, fast classical classifier (logistic regression) is trained on those labels for real-time use, instead of calling the LLM for every incoming ticket just to classify it. This also means that every accuracy figure here shows how closely the classifier agrees with the LLM labels, not how often it matches the decision of a human. A check against manually labelled tickets was done later, for the CSV triage tool only (200 tickets, two labellers): see the section "Check on 200 tickets" in [README_triage.md](README_triage.md). It does not cover the figures in this table.
 
 ### Independent re-check (16 Oct 2026)
 
