@@ -38,6 +38,27 @@ Useful options: `--output`, `--min-category-confidence 0.8` (stricter, more tick
 - An existing result file is never replaced silently (`--overwrite` is explicit). Two runs on the same output are refused (`<output>.lock`; delete it if a run was killed).
 - Changing the threshold after a run has finished means embedding (and paying for) the tickets again, because the progress file is removed at the end.
 
+## Check on 200 tickets (what was measured)
+
+This check was done once, by hand, on a public corpus. It is **not** an estimate for your ticket stream.
+
+- **Sample:** 200 support tweets from the public corpus that were not among the 20,000 training tickets. A quota sample: 5 companies, 40 each, three length groups (texts up to 287 characters). Two people labelled it independently with the same category definitions (agreement 186 of 200, 93%, Cohen's kappa 0.915). The definitions were written by the author, and one of the two labellers is the author.
+- **What the tool did:** accepted 93 tickets automatically (46.5%) and passed 107 to a human (2 of them empty).
+- **Result:** among the 93 automatically accepted tickets the model disagreed with the manual label as follows (per labeller):
+
+| Labeller | Disagreements | Share | 95% Clopper-Pearson interval |
+|---|---|---|---|
+| 1 | 15 of 93 | 16.1% | 9.3-25.2% |
+| 2 | 11 of 93 | 11.8% | 6.1-20.2% |
+
+The two figures belong to two labellers and are not independent estimates of the truth. The difference between them is four rows, for example replies like "thanks!" that one labeller put into "General inquiry / other" and the other into "Positive feedback / thanks" (as the model did). The intervals ignore the quota design; a calculation adjusted for it gave similar, equally wide intervals (15.8% and 13.6%).
+- **Priority** is only a hint: exact agreement with manual labels is 57.6-58.1%, with a tendency to overestimate (67 overestimates against 16-17 underestimates).
+- **Rare classes** cannot be assessed: "Service disruption" occurs once in all 200 tickets and not at all among the accepted ones.
+
+What this does **not** show: accuracy on your data; fresh data (the tweet dates lie inside the training period); texts longer than 287 characters; any other language or company; a calibrated threshold (a confidence of 0.70 is not a 70% probability). The training labels were assigned by a language model, not by people. The 14 tickets on which the two labellers disagreed with each other were not arbitrated, so there is no single final labelling of the 200 tickets. The check was run on 21 Oct 2026 and repeated on 30 Oct 2026 with `triage.py` version 12 and the two classifier files in this folder (the 200 texts were embedded again): all 200 rows gave the same category, priority, confidences (4 decimals) and pass-to-human flag as the saved results.
+
+**How to confirm on your own tickets:** you give 100-200 of your tickets, your staff label them by your category definitions without seeing the model's answers, and we count disagreements among the automatically accepted ones. For the claim "not above 15%" (one-sided 95% Clopper-Pearson) at most 8 disagreements are allowed at 100 accepted tickets, 15 at 150 and 21 at 200. That rule assumes a binomial model and does not confirm that the model suits any given sample.
+
 ## Known limits (please read)
 
 - **Accepted risk, paid batch:** if the process dies, or the service's answer fails the checks, between the service's reply and the write of the progress file, that one batch (up to 64 tickets) is embedded and paid again on restart. At the list price of this model ($0.02 per million tokens, from a third-party price list not checked against the provider) one batch costs a fraction of a cent. Identical texts in different rows are paid separately.
