@@ -55,13 +55,31 @@ The two figures belong to two labellers and are not independent estimates of the
 - **Priority** is only a hint: exact agreement with manual labels is 57.6-58.1%, with a tendency to overestimate (67 overestimates against 16-17 underestimates).
 - **Rare classes** cannot be assessed: "Service disruption" occurs once in all 200 tickets and not at all among the accepted ones.
 
-What this does **not** show: accuracy on your data; fresh data (the tweet dates lie inside the training period); texts longer than 287 characters; any other language or company; a calibrated threshold (a confidence of 0.70 is not a 70% probability). The training labels were assigned by a language model, not by people. The 14 tickets on which the two labellers disagreed with each other were not arbitrated, so there is no single final labelling of the 200 tickets. The check was run on 21 Oct 2026 and repeated on 30 Oct 2026 with `triage.py` version 12 and the two classifier files in this folder (the 200 texts were embedded again): all 200 rows gave the same category, priority, confidences (4 decimals) and pass-to-human flag as the saved results.
+What this does **not** show: accuracy on your data; fresh data (the tweet dates lie inside the training period); texts longer than 287 characters; any other language or company; a calibrated threshold (a confidence of 0.70 is not a 70% probability). The training labels were assigned by a language model, not by people. The 14 tickets on which the two labellers disagreed with each other were not arbitrated, so there is no single final labelling of the 200 tickets. The check was run on 21 Oct 2026 and repeated on 30 Oct 2026 with `triage.py` version 12 and the two classifier files in this folder (the 200 texts were embedded again, in the same batches as the first time): all 200 rows gave the same category, priority, confidences (4 decimals) and pass-to-human flag as the saved results. A later test with other batches shows that confidences can differ slightly between runs (see "Larger files and repeatability" below).
 
 **How to confirm on your own tickets:** you give 100-200 of your tickets, your staff label them by your category definitions without seeing the model's answers, and we count disagreements among the automatically accepted ones. For the claim "not above 15%" (one-sided 95% Clopper-Pearson) at most 8 disagreements are allowed at 100 accepted tickets, 15 at 150 and 21 at 200. That rule assumes a binomial model and does not confirm that the model suits any given sample.
 
+## Larger files and repeatability (31 Oct 2026)
+
+The same 200 texts were repeated to 500 and to 1000 rows (new ids, the original id kept in an extra column) and processed with `triage.py` version 12 and the same two classifier files, with a real Voyage call:
+
+| Rows | Time | Voyage tokens | Batches of 64 | Waits caused by service limits |
+|---|---|---|---|---|
+| 500 | 6.1 s | 13,746 (27.8 per embedded ticket) | 8 | 0 |
+| 1000 | 6.8 s | 27,395 (27.7 per embedded ticket) | 16 | 0 |
+
+This measures speed and stability on a larger file. It does **not** measure accuracy on new data, because repeated texts give repeated answers. Files larger than 1000 rows have not been run, and neither have long texts or other languages.
+
+**Repeatability.** The embedding service returned slightly different values for the same text when the text was in a batch of different composition (the first three batches, identical to the 200-ticket run, matched exactly; the other batches did not). Compared with the saved 200-ticket result, over 1,500 compared rows:
+- the pass-to-human flag and the priority label did not change in any row;
+- the category confidence differed in 125 of 500 and 367 of 1000 rows, by at most 0.012 (typical difference 0.0013);
+- the category changed for one text only (1 row in the 500-row file, 3 rows in the 1000-row file, all copies of that text): its two best categories were almost tied (confidence 0.437-0.440, far below the 0.70 threshold), and the row went to a human with either category.
+
+Rows whose confidence lies very close to 0.70 could in principle change the flag when batches change; in the saved 200-ticket result 6 of 198 rows lie within 0.012 of the threshold (none within 0.005). The cause of the small differences is not established; what was observed is a dependence on batch composition. For acceptance tests compare shares over many rows, not single rows between two runs.
+
 ## Known limits (please read)
 
-- **Accepted risk, paid batch:** if the process dies, or the service's answer fails the checks, between the service's reply and the write of the progress file, that one batch (up to 64 tickets) is embedded and paid again on restart. At the list price of this model ($0.02 per million tokens, from a third-party price list not checked against the provider) one batch costs a fraction of a cent. Identical texts in different rows are paid separately.
+- **Accepted risk, paid batch:** if the process dies, or the service's answer fails the checks, between the service's reply and the write of the progress file, that one batch (up to 64 tickets) is embedded and paid again on restart. At the list price of this model ($0.02 per million tokens, according to the Voyage AI documentation on mongodb.com/docs/voyageai/models, viewed 31 Oct 2026; your provider invoice decides) one batch costs a fraction of a cent. Identical texts in different rows are paid separately.
 - If `<output>.tmp` exists as a folder, the script stops with a Python error after the paid step; paid rows are kept and a restart does not pay again.
 - The classifiers were trained on **English** customer-support tweets of five companies (Apple, Amazon, Uber, Spotify, Delta), 8 fixed categories, short texts (under 300 characters). **Accuracy on your data is not known** until it is measured on your own tickets labelled by people. Category and priority labels used for training came from a language model, not from people.
 - Texts longer than 8000 characters are cut before embedding. No accuracy measurement exists for long texts; `--max-auto-chars` sends them to a human.
